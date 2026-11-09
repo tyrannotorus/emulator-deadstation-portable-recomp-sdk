@@ -1,0 +1,2236 @@
+diff --git a/src/rt/gpu_sdl3vk/ge_gpu.c b/src/rt/gpu_sdl3vk/ge_gpu.c
+index 92e5d2de..b4281d1b 100644
+--- a/src/rt/gpu_sdl3vk/ge_gpu.c
++++ b/src/rt/gpu_sdl3vk/ge_gpu.c
+@@ -129,18 +129,43 @@
+ #include <math.h>
+ #include <time.h>
+ 
++#ifdef SR_GE_NATIVE
++/* one queue, the screen's submissions on their own thread (runtime/brick/video.cpp): each of
++ * ours under the same lock, after the screen's queued ones (the queue keeps their order) */
++void brick_queue_lock(void) __attribute__((weak));
++void brick_queue_unlock(void) __attribute__((weak));
++void brick_submit_drain(void) __attribute__((weak));
++/* the GE's render submissions queued on the screen's submit thread (runtime/brick/brickvk.cpp): the driver's work in
++ * vkQueueSubmit off the GE worker; a fence wait covers a submission still queued there */
++void brick_submit_async(VkCommandBuffer cmd, VkFence fence) __attribute__((weak));
++static VkResult gegpu_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
++    if (brick_submit_drain) brick_submit_drain();
++    if (brick_queue_lock) brick_queue_lock();
++    const VkResult r = vkQueueSubmit(q, n, si, f);
++    if (brick_queue_unlock) brick_queue_unlock();
++    return r;
++}
++#define vkQueueSubmit gegpu_queue_submit
++#endif
++
+ #define FB_W 512            /* full PSP framebuffer stride (guest units) */
+ #define FB_H 272
+ #define DRAW_W 480          /* visible display width (presentation crop only) */
+ #define MAX_SCALE 4
+ static int s_scale = 1;     /* integer render scale (SR_GPU_SCALE), 1..MAX_SCALE */
++/* Vert+: s_vpad rows of picture above and below the guest's 272 in every target (the module's
++ * sdk_vplus_rows; 0 without one): guest row y is target row y + s_vpad, a scissor over the whole PSP screen and an untextured
++ * sprite over it reach the extra rows, and the screen shows all FB_HT. A 4:3 picture at 44 (480 x 360). */
++static int s_vpad = 0;
++int sdk_vplus_rows(void) __attribute__((weak));
++#define FB_HT ((uint32_t)(FB_H + 2 * s_vpad))
+ #define SCL_W ((uint32_t)(FB_W * s_scale))   /* device-pixel canvas */
+-#define SCL_H ((uint32_t)(FB_H * s_scale))
++#define SCL_H ((uint32_t)(FB_HT * s_scale))
+ /* The host twin's scale (#2050): the user's render scale, which the authentic chain keeps too
+  * (s_tscale == s_scale). The twin code is written for any whole ratio between the two. */
+ static int s_tscale = 1;
+ #define TSCL_W ((uint32_t)(FB_W * s_tscale))
+-#define TSCL_H ((uint32_t)(FB_H * s_tscale))
++#define TSCL_H ((uint32_t)(FB_HT * s_tscale))
+ #define MAX_VERTS  131072
+ #define MAX_BATCH  4096
+ #define PIPE_CACHE_INITIAL 192   /* growable: the state key space is not bounded by a constant */
+@@ -180,6 +205,11 @@ static int s_tscale = 1;
+ #define MAX_TNL_PARAMS 2048u
+ #define TNL_ARENA_VERTS (MAX_TNL_VERTS * 2u)
+ #define TNL_ARENA_PARAMS (MAX_TNL_PARAMS * 2u)
++/* the raw vertex bytes psp_tnl.vert decodes: staged per pending list, and each slot's arena */
++#define TNL_RAW_BYTES   (4u << 20)
++#define TNL_RAW_ARENA   (TNL_RAW_BYTES * 2u)
++/* a triangle corner for psp_tnl.vert: its vertex's byte offset in the slot's raw bytes, its parameter record */
++typedef struct { uint32_t off, param; } TnlCorner;
+ 
+ static const uint32_t k_vert_spv[] =
+ #include "psp_vert.inc"
+@@ -192,7 +222,7 @@ static const uint32_t k_tnl_vert_spv[] =
+ ;
+ /* psp_tnl.vert reads GeTnlParams as P_WORDS 32-bit words and GeTnlVtx as the vertex layout
+  * pipe_create gives it. */
+-_Static_assert(sizeof(GeTnlParams) == 247u * 4u, "psp_tnl.vert P_WORDS");
++_Static_assert(sizeof(GeTnlParams) == 272u * 4u, "psp_tnl.vert P_WORDS");
+ _Static_assert(sizeof(GeTnlVtx) == 72u, "psp_tnl.vert vertex layout");
+ 
+ /* ---- captured vertex (must match psp.vert input layout) ------------------------------ */
+@@ -207,7 +237,10 @@ typedef struct { int32_t cfg[4]; float texenv[4]; float fogcol[4]; float texsize
+ enum { F_TEX = 1, F_RGBA = 2, F_DBL = 4, F_FOG = 8, F_PERSP = 16, F_CLEAR = 32,
+        F_NEAREST = 64, F_SA2X = 128, F_SA2XI = 256, F_DITHER = 512, F_SHBLEND = 4096,
+        F_STENCIL = 8192, F_LODFRAG = 16384, F_SALPHA = 32768,
+-       F_FULLC = 65536 };                  /* host twin only: no 16-bit colour snap (#2050) */
++       F_FULLC = 65536,                    /* host twin only: no 16-bit colour snap (#2050) */
++       F_DUALSRC = 1048576,
++       F_CTEST = 2097152,
++       F_FLAT = 4194304 };               /* flat shading: psp.frag's v_color_flat */                /* colour test in the shader: dith[0] func, dith[1] ref, dith[2] mask */              /* fixed-function blend: the source alpha in output 1, no snap */
+ #define F_FMT_SHIFT 10                     /* bits 10-11: framebuffer psm for quantization */
+ /* bits 17-19 (cfg[0] bits 25-27): the bound texture is a scaled copy (tex_scale.h), factor =
+  * value + 1; 0 for every guest texture and render target, so the shader samples exactly as
+@@ -221,6 +254,12 @@ typedef struct {
+     uint8_t cmask;                         /* VkColorComponentFlags */
+     uint8_t tnl;                           /* 1: psp_tnl.vert over GeTnlVtx (#318) */
+     uint8_t azero;                         /* 1: alpha blend factors ZERO, ZERO (stores 0) */
++    uint8_t dualsrc;                       /* colour factors read output 1's alpha (SRC1) */
++    uint8_t astore;                        /* alpha blend factors ONE, ZERO (stores the shader's alpha) */
++    uint8_t logicop;                       /* 0, or the PSP's logic op + 1 (VkLogicOp has its order) */
++    uint8_t dstread;                       /* the shader reads the destination (shader blend, stencil) */
++    uint8_t discards;                      /* a test can drop the fragment: psp.frag's discards compiled in */
++    uint32_t fcfg;                         /* psp.frag's cfg.x (texture function, flags): a specialization constant */
+ } PipeKey;
+ 
+ typedef struct {
+@@ -238,6 +277,7 @@ typedef struct {
+      * texel to one pixel binds instead (xs_onetoone_plain). VK_NULL_HANDLE otherwise. */
+     VkDescriptorSet dset_plain;
+     uint32_t first, count;
++    uint32_t tparam;   /* a T&L batch's staged parameter record: one a draw (psp_tnl.vert's uniform buffer) */
+ } Batch;
+ 
+ /* Everything besides level 0 that shapes a cached mip chain and its sampler (#1373). All
+@@ -292,6 +332,7 @@ typedef struct {
+         VkDescriptorSet set;
+         VkSampler smp_af; VkDescriptorSet set_af;
+     } xs;
++    uint32_t hash_run;   /* the GE run (g_ge_run_gen) its content hash was last read in, + 1 */
+ } TexEnt;
+ 
+ typedef struct { PipeKey key; VkPipeline pipe; int used; } PipeEnt;
+@@ -359,6 +400,7 @@ typedef struct Target {
+     uint64_t wgen, tgen;
+     uint32_t tseed;
+     int tshow;                             /* the coming present shows the twin */
++    VkDescriptorSet inset;   /* set 2: this target's colour as the shader's input attachment (u_dst) */
+ } Target;
+ 
+ static void target_note_drawn(Target *t, int y0, int y1) {
+@@ -413,13 +455,22 @@ typedef struct {
+     uint32_t recorded_ops;
+     uint32_t vused;
+     /* GPU T&L arenas (#318): vertex references, parameter records, and the set binding them. */
+-    VkBuffer tbuf, pbuf;
+-    VkDeviceMemory tbuf_mem, pbuf_mem;
+-    GeTnlVtx *tmap;
++    VkBuffer tbuf, pbuf, rbuf;
++    VkDeviceMemory tbuf_mem, pbuf_mem, rbuf_mem;
++    uint8_t *rmap;
++    uint32_t rused;
++    VkBuffer ibuf;            /* the T&L indices */
++    VkDeviceMemory ibuf_mem;
++    uint32_t *imap;
++    uint32_t iused;
++    TnlCorner *tmap;
+     GeTnlParams *pmap;
+     VkDescriptorSet tset;
+     uint32_t tused, pused;
+     int in_flight;
++    uint64_t ring_lo[2];   /* the oldest T&L ring position its draws read, per region (UINT64_MAX: none) */
++    uint64_t ring_seq;     /* its place among the GE's submissions (brick_ge_submitted) */
++    int ring_done;         /* its fence seen signalled */
+     /* SR_GPU_TIMESTAMPS: timestamps written into this recording (its start, one after each
+      * recorded op, its end; 0 when none), and the submit reason of the work between query i and
+      * query i + 1. */
+@@ -455,6 +506,13 @@ static uint64_t s_cnt_xs_bound = 0, s_cnt_xs_uploads = 0, s_cnt_xs_stale = 0, s_
+ static uint64_t s_cnt_xs_reclaimed = 0, s_cnt_xs_budget_short = 0, s_cnt_xs_upload_capped = 0;
+ static uint32_t s_tex_pool_sets = 0;
+ static GeState  *s_ge;
++#ifdef SR_GE_NATIVE
++/* the renderer on a thread of its own: ge.c's run and CLUT counts as of the operation running */
++GeState *ge_backend_state_ptr(void);
++uint32_t ge_run_gen(void), ge_clut_gen(void);
++#define g_ge_run_gen ge_run_gen()
++#define g_ge_clut_gen ge_clut_gen()
++#endif
+ static uint16_t *s_zbuf;
+ 
+ static VkPhysicalDevice s_pdev;
+@@ -491,11 +549,56 @@ static VkShaderModule s_vs_tnl;
+ static VkDescriptorSetLayout s_tnl_dlayout;   /* set 1: the slot's GeTnlParams arena */
+ static VkDescriptorPool s_tnl_dpool;
+ static int s_tnl_ready;                       /* arenas and sets allocated */
+-static GeTnlVtx *s_tnl_vcpu;                  /* staged references, three per triangle */
++static TnlCorner *s_tnl_vcpu;                 /* staged corners, three per triangle (8 bytes, not a decoded vertex) */
++static uint8_t *s_tnl_rcpu;                   /* staged raw vertex bytes */
++typedef struct { const uint8_t *raw; uint32_t bytes, base; } RawRecent;
++static RawRecent s_raw_recent[4];             /* the last ranges staged: the guest's bytes and where they are */
++static int s_raw_next;
++static uint32_t s_nraw;
++static uint32_t *s_tnl_icpu;                  /* staged indices: three per triangle, into the staged vertex records */
++static uint32_t s_ntnli;
+ static GeTnlParams *s_tnl_pcpu;               /* staged parameter records */
+ static uint32_t s_ntnl, s_ntnlp;
++static uint32_t s_ntnlb;   /* staged PRIM boxes: PRIMs with the same T&L state share one parameter record */
++#ifdef SR_GE_NATIVE
++/* T&L staging in the submit slot's own mapped buffers: the raw vertex bytes, corners, indices and parameter records are written
++ * where the GPU reads them, and a render op draws them in place. The stage opens at the slot's cursors (stage_open) and is consumed
++ * by submit_range; a stage whose slot was submitted before it was consumed is copied, and one whose slot is about to be reused
++ * moves to the CPU arrays first (cmd_begin_fresh). Corners name raw offsets in the slot's buffer (s_stage_rbias added). */
++static TnlCorner *s_tnl_vhome;
++static uint8_t *s_tnl_rhome;
++static uint32_t *s_tnl_ihome;
++static GeTnlParams *s_tnl_phome;
++static SubmitSlot *s_stage_slot;
++static uint32_t s_sb_t, s_sb_r, s_sb_i, s_sb_p, s_stage_rbias;
++static uint32_t s_cap_t = MAX_TNL_VERTS, s_cap_r = TNL_RAW_BYTES, s_cap_i = MAX_TNL_VERTS, s_cap_p = MAX_TNL_PARAMS;
++static void stage_home(void);
++#endif
+ /* Screen box of each staged T&L PRIM (from ge.c's clip-space bound), for batch_rect. */
+-typedef struct { uint32_t first, end; float x0, y0, x1, y1; } TnlBox;
++typedef struct { uint32_t first, end; float x0, y0, x1, y1; uint32_t param; uint32_t raw0, raw1, vfirst, vend; } TnlBox;
++#ifdef SR_GE_NATIVE
++/* The T&L ring: one buffer the GPU reads a PRIM's indices (the index buffer), corners (the vertex
++ * buffer), raw vertex bytes (set 1's storage buffer) and record (set 1's uniform buffer, at a dynamic offset) from, all at offset 0,
++ * written by ge.c's front stage on its own thread (the GE in two stages): the renderer only appends the draw. Two
++ * regions: the indices (contiguous, so an object's PRIMs still merge into one draw) and the rest. Positions are running byte counts
++ * per region; the renderer publishes the oldest one a draw not yet done on the GPU (or not yet recorded) may read. A ring batch's
++ * tparam is RING_TP | its record's byte offset. */
++#define RING_IDX_BYTES (8u << 20)
++#define RING_DATA_BYTES (24u << 20)
++#define RING_TP 0x80000000u
++static VkBuffer s_ring_buf;
++static VkDeviceMemory s_ring_mem;
++static uint8_t *s_ring_map;
++static VkDescriptorPool s_ring_dpool;
++static VkDescriptorSet s_ring_set;
++static uint32_t s_ring_ubo_align;
++static int s_ring_on;
++static _Atomic uint64_t s_ring_free[2];
++static uint64_t s_ring_pending_lo[2] = { UINT64_MAX, UINT64_MAX }, s_ring_seen_end[2];
++static uint64_t s_ring_issued;   /* the GE's submissions made (brick_submit_async calls) */
++uint64_t brick_ge_submitted(void) __attribute__((weak));
++static void ring_publish(void);
++#endif
+ static TnlBox *s_tnl_box;
+ static unsigned long s_cnt_tnl_prims, s_cnt_tnl_tris;
+ 
+@@ -726,6 +829,12 @@ static size_t s_tex_shadow_bytes;
+ static unsigned long s_cnt_submit = 0, s_cnt_tri = 0, s_cnt_spr = 0, s_cnt_line = 0;
+ static unsigned long s_cnt_nonfinite = 0;
+ static uint64_t s_cnt_batches = 0, s_cnt_verts = 0;
++/* (dev) render passes, batches recorded, queue submits so far, for the GE worker's timing line */
++static uint64_t s_dev_passes, s_dev_batches, s_dev_submits;
++static uint64_t s_dev_texup, s_dev_texnew;
++void gegpu_dev_counts(uint64_t out[5]) {
++    out[0] = s_dev_passes; out[1] = s_dev_batches; out[2] = s_dev_submits; out[3] = s_dev_texup; out[4] = s_dev_texnew;
++}
+ unsigned long s_cnt_present_gpu = 0;
+ 
+ /* Public read-only accessor: number of GE list submissions since process start.
+@@ -1156,9 +1265,17 @@ static void ts_note_present(void) {
+ static int cmd_wait_slot(SubmitSlot *slot, GeGpuReplayBoundaryKind boundary) {
+     if (!slot || !slot->in_flight) return 1;
+     uint64_t perf_started = sr_perf_now_ns();
++#ifdef SR_GE_NATIVE
++    const uint64_t waited = 0;   /* no clock read around it */
++    /* its submission out of the screen's submit thread first: the PowerVR driver never wakes a wait begun before the fence was
++     * submitted (the first synchronous submit hung) */
++    if (brick_submit_drain) brick_submit_drain();
++    VKC(vkWaitForFences(s_dev, 1, &slot->fence, VK_TRUE, UINT64_MAX));
++#else
+     uint64_t wait_started = SDL_GetTicksNS();
+     VKC(vkWaitForFences(s_dev, 1, &slot->fence, VK_TRUE, UINT64_MAX));
+     uint64_t waited = SDL_GetTicksNS() - wait_started;
++#endif
+     ts_collect(slot);
+     replay_note_wait(boundary, waited);
+     if (perf_started) {
+@@ -1178,8 +1295,13 @@ static int cmd_wait_slot(SubmitSlot *slot, GeGpuReplayBoundaryKind boundary) {
+     slot->reason_mask = 0;
+     slot->recorded_ops = 0;
+     slot->vused = 0;
+-    slot->tused = slot->pused = 0;
++    slot->tused = slot->pused = 0; slot->rused = 0; slot->iused = 0;
+     slot->xfer_used = 0;
++#ifdef SR_GE_NATIVE
++    slot->ring_lo[0] = slot->ring_lo[1] = UINT64_MAX;
++    slot->ring_done = 0;
++    ring_publish();
++#endif
+     return 1;
+ }
+ 
+@@ -1201,6 +1323,9 @@ static int cmd_drain(GeGpuReplayBoundaryKind boundary) {
+     /* A single wait-all is sufficient at a CPU-visible boundary. All work is on
+      * one queue, so it also preserves render -> copy -> next-render ordering. */
+     uint64_t perf_started = sr_perf_now_ns();
++#ifdef SR_GE_NATIVE
++    if (brick_submit_drain) brick_submit_drain();   /* every fence submitted before the wait (cmd_wait_slot) */
++#endif
+     uint64_t wait_started = SDL_GetTicksNS();
+     VKC(vkWaitForFences(s_dev, count, fences, VK_TRUE, UINT64_MAX));
+     uint64_t waited = SDL_GetTicksNS() - wait_started;
+@@ -1228,7 +1353,7 @@ static int cmd_drain(GeGpuReplayBoundaryKind boundary) {
+         slot->reason_mask = 0;
+         slot->recorded_ops = 0;
+         slot->vused = 0;
+-        slot->tused = slot->pused = 0;
++        slot->tused = slot->pused = 0; slot->rused = 0; slot->iused = 0;
+         slot->xfer_used = 0;
+     }
+     return 1;
+@@ -1238,6 +1363,23 @@ static int cmd_drain(GeGpuReplayBoundaryKind boundary) {
+  * retires, which also protects every vertex-arena range previously submitted in it. */
+ static int cmd_begin_fresh(void) {
+     SubmitSlot *slot = &s_submit[s_async_submit ? s_submit_cursor : 0];
++#ifdef SR_GE_NATIVE
++    if (slot == s_stage_slot) {
++        /* a stage not yet drawn in the slot about to be reused: into the CPU arrays first (its raw offsets kept) */
++        if (s_ntnl || s_ntnli || s_ntnlp || s_nraw) {
++            if (!cmd_wait_slot(slot, GEGPU_BOUNDARY_OTHER)) return 0;
++            memmove(s_tnl_rhome, s_tnl_rcpu, s_nraw);
++            memmove(s_tnl_vhome, s_tnl_vcpu, (size_t)s_ntnl * sizeof(TnlCorner));
++            memmove(s_tnl_ihome, s_tnl_icpu, (size_t)s_ntnli * sizeof(uint32_t));
++            memmove(s_tnl_phome, s_tnl_pcpu, (size_t)s_ntnlp * sizeof(GeTnlParams));
++            const uint32_t bias = s_stage_rbias;
++            stage_home();
++            s_stage_rbias = bias;
++        } else {
++            stage_home();
++        }
++    }
++#endif
+     if (!cmd_wait_slot(slot, GEGPU_BOUNDARY_OTHER)) return 0;
+     /* A synchronous boundary can retire earlier queue work without acquiring every
+      * signaled GE slot. Starting a new recording always owns a fresh arena logically,
+@@ -1245,8 +1387,12 @@ static int cmd_begin_fresh(void) {
+     slot->reason_mask = 0;
+     slot->recorded_ops = 0;
+     slot->vused = 0;
+-    slot->tused = slot->pused = 0;
++    slot->tused = slot->pused = 0; slot->rused = 0; slot->iused = 0;
+     slot->xfer_used = 0;
++#ifdef SR_GE_NATIVE
++    slot->ring_lo[0] = slot->ring_lo[1] = UINT64_MAX;
++    slot->ring_done = 0;
++#endif
+     s_cmd_slot = slot;
+     s_cmd = slot->cmd;
+     vkResetCommandBuffer(s_cmd, 0);
+@@ -1264,11 +1410,20 @@ static int cmd_finish_submit(SrPerfGeReason reason, int defer) {
+     VKC(vkEndCommandBuffer(s_cmd));
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+     si.commandBufferCount = 1; si.pCommandBuffers = &s_cmd;
++#ifdef SR_GE_NATIVE
++    /* no clock read around it (each one a system call on the Brick) */
++    if (brick_submit_async) brick_submit_async(s_cmd, slot->fence);
++    else VKC(vkQueueSubmit(s_queue, 1, &si, slot->fence));
++    s_dev_submits++;
++    slot->ring_seq = ++s_ring_issued;
++#else
+     uint64_t submit_started = SDL_GetTicksNS();
+     uint64_t perf_submit_started = sr_perf_now_ns();
+     VKC(vkQueueSubmit(s_queue, 1, &si, slot->fence));
++    s_dev_submits++;
+     if (perf_submit_started) sr_perf_vulkan_submit(perf_submit_started);
+     replay_note_submit(reason, SDL_GetTicksNS() - submit_started);
++#endif
+     if (sr_perf_enabled) sr_perf_ge_submit(reason);
+     slot->reason = reason;
+     slot->in_flight = 1;
+@@ -1278,6 +1433,9 @@ static int cmd_finish_submit(SrPerfGeReason reason, int defer) {
+     if (defer) s_submit_cursor = (s_submit_cursor + 1u) % SUBMIT_FRAMES;
+     s_cmd_slot = NULL;
+     s_cmd = VK_NULL_HANDLE;
++#ifdef SR_GE_NATIVE
++    ring_publish();
++#endif
+     if (!defer && !cmd_wait_slot(slot, boundary_for_reason(reason))) return 0;
+     return 1;
+ }
+@@ -1302,20 +1460,27 @@ static int cmd_begin(void) {
+ 
+ /* `tverts` and `tparams` are the T&L arena space the op needs; tparams counts the records
+  * from the start of the staged array, as submit_range may place them past the slot's cursor. */
+-static int cmd_batch_begin_tnl(uint32_t vertices, uint32_t tverts, uint32_t tparams) {
+-    if (vertices > VERT_ARENA_VERTS || tverts > TNL_ARENA_VERTS || tparams > TNL_ARENA_PARAMS)
++static int cmd_batch_begin_tnl_idx(uint32_t vertices, uint32_t tverts, uint32_t tparams, uint32_t traw, uint32_t tidx);
++static int cmd_batch_begin_tnl(uint32_t vertices, uint32_t tverts, uint32_t tparams, uint32_t traw) {
++    return cmd_batch_begin_tnl_idx(vertices, tverts, tparams, traw, 0u);
++}
++static int cmd_batch_begin_tnl_idx(uint32_t vertices, uint32_t tverts, uint32_t tparams, uint32_t traw, uint32_t tidx) {
++    if (vertices > VERT_ARENA_VERTS || tverts > TNL_ARENA_VERTS || tparams > TNL_ARENA_PARAMS || traw > TNL_RAW_ARENA ||
++        tidx > TNL_ARENA_VERTS)
+         return 0;
+     if (s_cmd_slot && (s_cmd_slot->recorded_ops >= s_submit_batch_ops ||
+                        s_cmd_slot->vused + vertices > VERT_ARENA_VERTS ||
+                        s_cmd_slot->tused + tverts > TNL_ARENA_VERTS ||
+-                       s_cmd_slot->pused + tparams > TNL_ARENA_PARAMS)) {
++                       s_cmd_slot->pused + tparams > TNL_ARENA_PARAMS ||
++                       s_cmd_slot->rused + traw > TNL_RAW_ARENA ||
++                       s_cmd_slot->iused + tidx > TNL_ARENA_VERTS)) {
+         if (!cmd_batch_flush()) return 0;
+     }
+     if (!s_cmd_slot && !cmd_begin_fresh()) return 0;
+     return 1;
+ }
+ 
+-static int cmd_batch_begin(uint32_t vertices) { return cmd_batch_begin_tnl(vertices, 0u, 0u); }
++static int cmd_batch_begin(uint32_t vertices) { return cmd_batch_begin_tnl(vertices, 0u, 0u, 0u); }
+ 
+ static int cmd_batch_record(SrPerfGeReason reason) {
+     if (!s_cmd_slot) return 0;
+@@ -1485,7 +1650,7 @@ static uint32_t readback_row_step(void) {
+ }
+ 
+ static VkDeviceSize readback_bytes(uint32_t bpp) {
+-    return (VkDeviceSize)SCL_W * (s_readback_full ? SCL_H : FB_H) * bpp;
++    return (VkDeviceSize)SCL_W * (s_readback_full ? (uint32_t)(FB_H * s_scale) : FB_H) * bpp;
+ }
+ 
+ static void cmd_copy_readback(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect,
+@@ -1497,9 +1662,9 @@ static void cmd_copy_readback(VkCommandBuffer cmd, VkImage img, VkImageAspectFla
+         c[i].bufferOffset = (VkDeviceSize)i * SCL_W * bpp;
+         c[i].imageSubresource.aspectMask = aspect;
+         c[i].imageSubresource.layerCount = 1;
+-        c[i].imageOffset.y = (int32_t)(i * (uint32_t)s_scale);
++        c[i].imageOffset.y = (int32_t)(((uint32_t)s_vpad + i) * (uint32_t)s_scale);
+         c[i].imageExtent.width = SCL_W;
+-        c[i].imageExtent.height = regions == 1u ? SCL_H : 1u;
++        c[i].imageExtent.height = regions == 1u ? (uint32_t)(FB_H * s_scale) : 1u;
+         c[i].imageExtent.depth = 1;
+     }
+     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, regions, c);
+@@ -1806,6 +1971,55 @@ static void pcache_close(int save) {
+ 
+ /* ---- pipelines ------------------------------------------------------------------------ */
+ 
++/* Dual-source blending, where the device has it (the Brick's GE8300: brick_dual_src_blend, the
++ * presenter enabled the feature): a fixed-function blend reads the source alpha from the shader's second output, so output 0's
++ * alpha can be what the PSP stores there (a constant stencil), and a 16-bit target's source needs no snap before the blend. Off with
++ * SR_GPU_EXACT_BLEND16=1: the runtime's exact shader blends and stencils, a destination snapshot each. */
++int brick_dual_src_blend(void) __attribute__((weak));
++int brick_raster_order(void) __attribute__((weak));
++/* a module's say over each sprite: in its texture address and whether texturing is on, through mode, the box in
++ * pixels; out dy (pixels, down) and skip */
++/* and the texture coordinates' box (raw u, v in through mode) and the texture's size: a module can tell a piece of a
++ * whole-screen picture drawn 1:1 (a movie's or a background's tiles) from a HUD's or a menu's element */
++typedef struct { uint32_t tex_addr; int tex_enable; int through; float x0, y0, x1, y1; float dy; int skip;
++                 float u0, v0, u1, v1; int tex_w, tex_h; int extend; int tnl; } SdkSpriteDraw;   /* tnl: ge.c's */
++/* out `extend`: a 2D sprite left in place may draw into Vert+'s rows above and below (a background whose texture has
++ * more picture there); without it it keeps the PSP's rows */
++void sdk_sprite_draw(SdkSpriteDraw *d) __attribute__((weak));
++static int raster_order_on(void) {
++    static int v = -1;
++    if (v < 0) {
++        v = brick_raster_order && brick_raster_order();
++        fprintf(stderr, "gegpu: destination reads %s\n", v ? "in raster order (no barriers)" : "behind by-region barriers");
++    }
++    return v;
++}
++static int exact_blend16(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("SR_GPU_EXACT_BLEND16");
++        v = e && e[0] && e[0] != '0';
++        fprintf(stderr, "gegpu: 16-bit and dithered blends %s\n",
++                v ? "in the shader, exact (SR_GPU_EXACT_BLEND16)" : "in fixed function (as PPSSPP)");
++    }
++    return v;
++}
++static int dual_src_on(void) {
++    static int v = -1;
++    if (v < 0) {
++        v = !exact_blend16() && brick_dual_src_blend && brick_dual_src_blend();
++        fprintf(stderr, "gegpu: dual-source blending %s\n",
++                v ? "on: constant stencils and 16-bit targets blend in fixed function" : "off");
++    }
++    return v;
++}
++static VkBlendFactor dual_factor(VkBlendFactor f, int dual) {
++    if (!dual) return f;
++    if (f == VK_BLEND_FACTOR_SRC_ALPHA) return VK_BLEND_FACTOR_SRC1_ALPHA;
++    if (f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
++    return f;
++}
++
+ static VkPipeline pipe_create(const PipeKey *k) {
+     uint64_t profile_started = cpu_profile_now();
+     VkPipelineShaderStageCreateInfo st[2] = {
+@@ -1814,6 +2028,19 @@ static VkPipeline pipe_create(const PipeKey *k) {
+     };
+     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = k->tnl ? s_vs_tnl : s_vs; st[0].pName = "main";
+     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = s_fs; st[1].pName = "main";
++    /* psp.frag's discards only in a pipeline whose draws can drop a fragment (alpha, colour,
++     * depth-range or stencil test): the others never discard, and the tile GPU's hidden surface removal shades each pixel once */
++    /* and psp.frag's flags and texture function as constants: each pipeline compiled with only the paths its draws
++     * take, no branch on them per pixel */
++    const struct { VkBool32 can_discard; int32_t cfg; } spec_data = { k->discards ? VK_TRUE : VK_FALSE, (int32_t)k->fcfg };
++    const VkSpecializationMapEntry sme[2] = { { 0, 0, sizeof(VkBool32) }, { 1, sizeof(VkBool32), sizeof(int32_t) } };
++    const VkSpecializationInfo spec = { 2, sme, sizeof(spec_data), &spec_data };
++    st[1].pSpecializationInfo = &spec;
++    /* Vert+'s rows for both vertex shaders */
++    const float vspec_data[2] = { (float)s_vpad, 2.0f / (float)FB_HT };
++    const VkSpecializationMapEntry vsme[2] = { { 10, 0, sizeof(float) }, { 11, sizeof(float), sizeof(float) } };
++    const VkSpecializationInfo vspec = { 2, vsme, sizeof(vspec_data), vspec_data };
++    st[0].pSpecializationInfo = &vspec;
+ 
+     VkVertexInputBindingDescription bind = { 0, sizeof(GpuVert), VK_VERTEX_INPUT_RATE_VERTEX };
+     VkVertexInputAttributeDescription at[5] = {
+@@ -1824,20 +2051,16 @@ static VkPipeline pipe_create(const PipeKey *k) {
+         { 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(GpuVert, box) },
+     };
+     /* GeTnlVtx for psp_tnl.vert */
+-    VkVertexInputBindingDescription tbind = { 0, sizeof(GeTnlVtx), VK_VERTEX_INPUT_RATE_VERTEX };
+-    VkVertexInputAttributeDescription tat[7] = {
+-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(GeTnlVtx, x) },
+-        { 1, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(GeTnlVtx, nx) },
+-        { 2, 0, VK_FORMAT_R32G32_SFLOAT,       (uint32_t)offsetof(GeTnlVtx, u) },
+-        { 3, 0, VK_FORMAT_R8G8B8A8_UINT,       (uint32_t)offsetof(GeTnlVtx, rgba) },
+-        { 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(GeTnlVtx, w) },
+-        { 5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(GeTnlVtx, w) + 16u },
+-        { 6, 0, VK_FORMAT_R32_UINT,            (uint32_t)offsetof(GeTnlVtx, param) },
++    /* TnlCorner for psp_tnl.vert: the vertex's raw byte offset, its parameter record */
++    VkVertexInputBindingDescription tbind = { 0, sizeof(TnlCorner), VK_VERTEX_INPUT_RATE_VERTEX };
++    VkVertexInputAttributeDescription tat[2] = {
++        { 0, 0, VK_FORMAT_R32_UINT, (uint32_t)offsetof(TnlCorner, off) },
++        { 1, 0, VK_FORMAT_R32_UINT, (uint32_t)offsetof(TnlCorner, param) },
+     };
+     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+     vi.vertexBindingDescriptionCount = 1;
+     vi.pVertexBindingDescriptions = k->tnl ? &tbind : &bind;
+-    vi.vertexAttributeDescriptionCount = k->tnl ? 7u : 5u;
++    vi.vertexAttributeDescriptionCount = k->tnl ? 2u : 5u;
+     vi.pVertexAttributeDescriptions = k->tnl ? tat : at;
+ 
+     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+@@ -1864,16 +2087,22 @@ static VkPipeline pipe_create(const PipeKey *k) {
+ 
+     VkPipelineColorBlendAttachmentState ba = {0};
+     ba.blendEnable = k->blend_on;
+-    ba.srcColorBlendFactor = (VkBlendFactor)k->srcf;
+-    ba.dstColorBlendFactor = (VkBlendFactor)k->dstf;
++    ba.srcColorBlendFactor = dual_factor((VkBlendFactor)k->srcf, k->dualsrc);
++    ba.dstColorBlendFactor = dual_factor((VkBlendFactor)k->dstf, k->dualsrc);
+     ba.colorBlendOp = (VkBlendOp)k->eq;
+-    /* PSP: dst alpha = clamp(sa + da); a constant stencil of 0 (stencil_fixed_alpha) stores 0 */
+-    ba.srcAlphaBlendFactor = k->azero ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+-    ba.dstAlphaBlendFactor = k->azero ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
++    /* PSP: dst alpha = clamp(sa + da); a constant stencil of 0 (stencil_fixed_alpha) stores 0; another constant (dual
++     * source: output 0's alpha is the constant) is stored as it is */
++    ba.srcAlphaBlendFactor = k->astore ? VK_BLEND_FACTOR_ONE : k->azero ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
++    ba.dstAlphaBlendFactor = k->astore ? VK_BLEND_FACTOR_ZERO : k->azero ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+     ba.alphaBlendOp = VK_BLEND_OP_ADD;
+     ba.colorWriteMask = k->cmask;
+     VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+     cb.attachmentCount = 1; cb.pAttachments = &ba;
++    /* ordered only where the shader reads the destination: every other draw's fragments run as the
++     * GPU likes */
++    if (raster_order_on() && k->dstread) cb.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
++    /* the PSP's logic op in fixed function, after the shader's colour (its blend included, the PSP's order) */
++    if (k->logicop) { cb.logicOpEnable = VK_TRUE; cb.logicOp = (VkLogicOp)(k->logicop - 1u); }
+ 
+     VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+@@ -1912,10 +2141,21 @@ static VkPipeline pipe_create(const PipeKey *k) {
+     return p;
+ }
+ 
++/* the pipelines by key hash (open addressing, entries index + 1): specialized pipelines are many */
++#define PIPE_INDEX 4096u
++static int s_pipe_index[PIPE_INDEX];
++static uint32_t pipe_key_hash(const PipeKey *k) {
++    const uint8_t *b = (const uint8_t *)k;
++    uint32_t h = 2166136261u;
++    for (size_t i = 0; i < sizeof(*k); i++) h = (h ^ b[i]) * 16777619u;
++    return h;
++}
+ static VkPipeline pipe_get(const PipeKey *k) {
+     uint64_t profile_started = cpu_profile_now();
+-    for (int i = 0; i < s_pipe_n; i++) {
+-        if (!memcmp(&s_pipes[i].key, k, sizeof(*k))) {
++    uint32_t hi = pipe_key_hash(k) & (PIPE_INDEX - 1u);
++    for (uint32_t probe = 0; probe < PIPE_INDEX && s_pipe_index[hi]; probe++, hi = (hi + 1u) & (PIPE_INDEX - 1u)) {
++        const int i = s_pipe_index[hi] - 1;
++        if (i < s_pipe_n && !memcmp(&s_pipes[i].key, k, sizeof(*k))) {
+             if (s_cpu_profile) {
+                 s_cpu_profile_stats.pipeline_hits++;
+                 cpu_profile_add(GEGPU_CPU_PIPELINE_LOOKUP, profile_started);
+@@ -1939,6 +2179,7 @@ static VkPipeline pipe_get(const PipeKey *k) {
+     VkPipeline p = pipe_create(k);
+     if (!p) return VK_NULL_HANDLE;
+     s_pipes[s_pipe_n].key = *k; s_pipes[s_pipe_n].pipe = p; s_pipe_n++;
++    if (!s_pipe_index[hi]) s_pipe_index[hi] = s_pipe_n;   /* hi: the free slot the probe stopped at */
+     return p;
+ }
+ 
+@@ -1987,6 +2228,29 @@ static VkDescriptorSet make_dst_descriptor(VkImageView view, VkDescriptorPool po
+     return set;
+ }
+ 
++/* The destination a shader blend or stencil reads is the target itself, as an input attachment
++ * of the one subpass (u_dst: subpassLoad): no copy of the target and no new render pass for it, a by-region barrier between
++ * batches where one reads what an earlier one of the same pass drew (record_range). On a tiler (the Brick's GE8300) that stays
++ * in tile memory; a copy and a submission cost ~1.5 ms each. The host twin, which read its own snapshot, is not available. */
++static VkDescriptorPool s_dpool_in;
++static VkDescriptorSet make_input_descriptor(VkImageView view) {
++    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++    dai.descriptorPool = s_dpool_in; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_dst_dlayout;
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    if (vkAllocateDescriptorSets(s_dev, &dai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
++    VkDescriptorImageInfo dii = { VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
++    VkWriteDescriptorSet wr = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++    wr.dstSet = set; wr.dstBinding = 0; wr.descriptorCount = 1;
++    wr.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
++    wr.pImageInfo = &dii;
++    vkUpdateDescriptorSets(s_dev, 1, &wr, 0, NULL);
++    return set;
++}
++static void target_inset_free(Target *t) {
++    if (t->inset) vkFreeDescriptorSets(s_dev, s_dpool_in, 1, &t->inset);
++    t->inset = VK_NULL_HANDLE;
++}
++
+ /* ---- batch submission (GPU only, no VRAM I/O) ------------------------------------------- */
+ 
+ static uint32_t s_flushgen = 1;            /* bumped per submit: invalidates state template */
+@@ -2001,7 +2265,8 @@ static uint32_t s_pend_batches, s_pend_count;
+ static void batches_reset(void) {
+     s_nbatch = 0; s_nverts = 0;
+     s_nwbatch = 0;
+-    s_ntnl = 0; s_ntnlp = 0;
++    s_ntnl = 0; s_ntnlp = 0; s_ntnlb = 0; s_nraw = 0; s_ntnli = 0;
++    memset(s_raw_recent, 0, sizeof(s_raw_recent));
+     s_pend_box = k_snap_rect_empty;
+     s_pend_batches = s_pend_count = 0;
+     s_flushgen++;
+@@ -2063,12 +2328,12 @@ static SnapRect tnl_rect(const Batch *b, uint32_t first, uint32_t count) {
+     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+     /* The boxes are in staging order, so by first reference: find the first PRIM that ends
+      * past `first`, then walk while PRIMs start before the range's end. */
+-    uint32_t lo = 0, hi = s_ntnlp;
++    uint32_t lo = 0, hi = s_ntnlb;
+     while (lo < hi) {
+         uint32_t mid = lo + (hi - lo) / 2u;
+         if (s_tnl_box[mid].end <= first) lo = mid + 1u; else hi = mid;
+     }
+-    for (uint32_t i = lo; i < s_ntnlp && s_tnl_box[i].first < first + count; i++) {
++    for (uint32_t i = lo; i < s_ntnlb && s_tnl_box[i].first < first + count; i++) {
+         const TnlBox *t = &s_tnl_box[i];
+         if (t->x0 < x0) x0 = t->x0;
+         if (t->y0 < y0) y0 = t->y0;
+@@ -2151,10 +2416,11 @@ static void snapshot_copy_record(Target *t, VkImageLayout t_after) {
+     ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     ic.srcSubresource.layerCount = 1;
+     ic.dstSubresource = ic.srcSubresource;
+-    ic.srcOffset.x = r.x0 * s_scale; ic.srcOffset.y = r.y0 * s_scale;
++    ic.srcOffset.x = r.x0 * s_scale; ic.srcOffset.y = (r.y0 + s_vpad) * s_scale;
+     ic.dstOffset = ic.srcOffset;
+     ic.extent.width = (uint32_t)((r.x1 - r.x0) * s_scale);
+     ic.extent.height = (uint32_t)((r.y1 - r.y0) * s_scale);
++    if (s_vpad && r.y0 == 0 && r.y1 == FB_H) { ic.srcOffset.y = ic.dstOffset.y = 0; ic.extent.height = SCL_H; }
+     ic.extent.depth = 1;
+     vkCmdCopyImage(s_cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    s_snapimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+@@ -2242,6 +2508,7 @@ typedef struct {
+     const Batch *arr;
+     uint32_t b0, b1, v0, tv0, p0, param_base, ntverts;
+     VkDeviceSize vertex_offset, tvertex_offset;
++    uint32_t vr0, ibase;   /* the range's first staged vertex record; its indices' place in the slot */
+ } RangeRec;
+ 
+ /* Record batches [r->b0, r->b1) as one render pass into `t`'s image, or (twin) into its host
+@@ -2262,10 +2529,14 @@ static void record_range(Target *t, const RangeRec *r, int twin) {
+ 
+     /* each chain draws at its own scale */
+     const int scale = twin ? s_tscale : s_scale;
+-    const uint32_t cw = (uint32_t)(FB_W * scale), ch = (uint32_t)(FB_H * scale);
++    const uint32_t cw = (uint32_t)(FB_W * scale), ch = (uint32_t)(FB_HT * scale);
+     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+     rbi.renderPass = s_rp; rbi.framebuffer = twin ? t->tfb : t->fb;
+     rbi.renderArea.extent.width = cw; rbi.renderArea.extent.height = ch;
++    if (!twin && !t->inset) {
++        t->inset = make_input_descriptor(t->view);
++        if (!t->inset) fprintf(stderr, "gegpu: no input-attachment set for a target: its shader blends read nothing\n");
++    }
+     vkCmdBeginRenderPass(s_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+ 
+     /* the vertex NDC transform is resolution-independent: scaling the viewport IS the
+@@ -2273,19 +2544,40 @@ static void record_range(Target *t, const RangeRec *r, int twin) {
+     VkViewport vp = { 0, 0, (float)cw, (float)ch, 0.0f, 1.0f };
+     vkCmdSetViewport(s_cmd, 0, 1, &vp);
+     const uint32_t b0 = r->b0, b1 = r->b1, v0 = r->v0, tv0 = r->tv0, p0 = r->p0;
++    s_dev_passes++;
++    s_dev_batches += b1 - b0;
+     const uint32_t param_base = r->param_base;
+     int bound_tnl = -1;
+-    if (r->ntverts)
+-        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1,
+-                                &s_cmd_slot->tset, 0, NULL);
++    uint32_t bound_param = UINT32_MAX;   /* the record set 1 is bound at, by its dynamic offset */
+     /* set 2: the destination snapshot (the twin's pass reads the twin snapshot) */
+     vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 2, 1,
+-                            twin ? &s_tdst_set : &s_dst_set, 0, NULL);
++                            twin ? &s_tdst_set : &t->inset, 0, NULL);
+ 
+     VkPipeline cur = VK_NULL_HANDLE;
+     VkDescriptorSet cur_set = VK_NULL_HANDLE;
++    SnapRect since_barrier = { 0, 0, 0, 0 };   /* drawn in this pass since its last barrier */
++    /* the state last set in this pass: a batch sets only what differs (one pipeline layout, dynamic
++     * scissor and blend constants: all of it outlives a pipeline bind) */
++    VkRect2D cur_sc = { { -1, -1 }, { 0, 0 } };
++    float cur_bconst[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
++    const PushPC *cur_pc = NULL;
++    PushPC cur_pc_copy;
++    const int barriers = !raster_order_on();
+     for (uint32_t i = b0; i < b1; i++) {
+         const Batch *b = &r->arr[i];
++        if (barriers) {
++            const SnapRect box = batch_rect(b);
++            if (!raster_order_on() && batch_reads_dst(b) && snap_rect_overlap(&box, &since_barrier)) {
++                VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++                mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++                mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
++                vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                                     VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
++                s_cnt_snap++;   /* (counted where the snapshots were) */
++                since_barrier = k_snap_rect_empty;
++            }
++            snap_rect_union(&since_barrier, &box);
++        }
+         VkPipeline p = pipe_get(&b->key);
+         if (!p) {
+             /* Not expected once the cache grows; say so rather than dropping silently. */
+@@ -2307,30 +2599,78 @@ static void record_range(Target *t, const RangeRec *r, int twin) {
+         } else if (s_cpu_profile) {
+             s_cpu_profile_stats.pipeline_bind_redundant++;
+         }
+-        VkRect2D sc = { { b->sx * scale, b->sy * scale },
++        VkRect2D sc = { { b->sx * scale, (b->sy + s_vpad) * scale },
+                         { (uint32_t)(b->sw * scale), (uint32_t)(b->sh * scale) } };
+-        vkCmdSetScissor(s_cmd, 0, 1, &sc);
+-        vkCmdSetBlendConstants(s_cmd, b->bconst);
++        {   /* (dev) DSP_GPU_NOFRAG=1: a one-pixel scissor, the GPU's time without fragments (vertices and binning) */
++            static int nofrag = -1;
++            if (nofrag < 0) nofrag = getenv("DSP_GPU_NOFRAG") != NULL;
++            if (nofrag) { sc.offset.x = sc.offset.y = 0; sc.extent.width = sc.extent.height = 1; }
++        }
++        if (memcmp(&sc, &cur_sc, sizeof(sc)) != 0) { vkCmdSetScissor(s_cmd, 0, 1, &sc); cur_sc = sc; }
++        if (memcmp(b->bconst, cur_bconst, sizeof(cur_bconst)) != 0) {
++            vkCmdSetBlendConstants(s_cmd, b->bconst);
++            memcpy(cur_bconst, b->bconst, sizeof(cur_bconst));
++        }
+         PushPC tpc;
+         if (twin) twin_pc(b, &tpc);
+-        vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(b->pc),
+-                           twin ? &tpc : &b->pc);
++        const PushPC *pc = twin ? &tpc : &b->pc;
++        if (!cur_pc || memcmp(pc, &cur_pc_copy, sizeof(*pc)) != 0) {
++            vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(b->pc), pc);
++            cur_pc_copy = *pc;
++            cur_pc = &cur_pc_copy;
++        }
+         VkDescriptorSet dset = twin ? twin_dset(b) : b->dset;
+         uint64_t bind_started = cpu_profile_now();
+-        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1, &dset, 0, NULL);
++        if (dset != cur_set)
++            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1, &dset, 0, NULL);
+         if (s_cpu_profile) {
+             cpu_profile_add(GEGPU_CPU_BIND_RECORD, bind_started);
+             s_cpu_profile_stats.descriptor_binds++;
+             if (dset == cur_set) s_cpu_profile_stats.descriptor_bind_redundant++;
+         }
+         cur_set = dset;
+-        if (bound_tnl != (int)b->key.tnl) {
++#ifdef SR_GE_NATIVE
++        const int ring = b->key.tnl && (b->tparam & RING_TP);   /* the T&L ring's draw */
++        const int kind = ring ? 2 : (int)b->key.tnl;
++#else
++        const int kind = (int)b->key.tnl;
++#endif
++        if (bound_tnl != kind) {
++#ifdef SR_GE_NATIVE
++            if (ring) {
++                const VkDeviceSize zero = 0;
++                vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring_buf, &zero);
++                vkCmdBindIndexBuffer(s_cmd, s_ring_buf, 0, VK_INDEX_TYPE_UINT32);
++            } else
++#endif
++            {
+             vkCmdBindVertexBuffers(s_cmd, 0, 1, b->key.tnl ? &s_cmd_slot->tbuf : &s_cmd_slot->vbuf,
+                                    b->key.tnl ? &r->tvertex_offset : &r->vertex_offset);
+-            bound_tnl = (int)b->key.tnl;
++            if (b->key.tnl)
++                vkCmdBindIndexBuffer(s_cmd, s_cmd_slot->ibuf, (VkDeviceSize)r->ibase * sizeof(uint32_t), VK_INDEX_TYPE_UINT32);
++            }
++            bound_tnl = kind;
+         }
+-        if (b->key.tnl)
+-            vkCmdDraw(s_cmd, b->count, 1, b->first - tv0, param_base - p0);
++        if (b->key.tnl && b->tparam != bound_param) {   /* the draw's record */
++#ifdef SR_GE_NATIVE
++            if (ring) {
++                const uint32_t off = b->tparam & ~RING_TP;
++                vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1, &s_ring_set, 1, &off);
++            } else
++#endif
++            {
++            const uint32_t off = (param_base + (b->tparam - p0)) * (uint32_t)sizeof(GeTnlParams);
++            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1, &s_cmd_slot->tset, 1, &off);
++            }
++            bound_param = b->tparam;
++        }
++#ifdef SR_GE_NATIVE
++        if (ring)
++            vkCmdDrawIndexed(s_cmd, b->count, 1, b->first, 0, 0);
++        else
++#endif
++        if (b->key.tnl)   /* indexed: each vertex transformed once */
++            vkCmdDrawIndexed(s_cmd, b->count, 1, b->first - tv0, -(int32_t)r->vr0, 0);
+         else
+             vkCmdDraw(s_cmd, b->count, 1, b->first - v0, 0);
+     }
+@@ -2345,6 +2685,9 @@ static int submit_range(Target *t, const Batch *arr, uint32_t b0, uint32_t b1) {
+     uint32_t v0 = UINT32_MAX, v1 = 0, tv0 = UINT32_MAX, tv1 = 0;
+     for (uint32_t i = b0; i < b1; i++) {
+         const Batch *b = &arr[i];
++#ifdef SR_GE_NATIVE
++        if (b->key.tnl && (b->tparam & RING_TP)) continue;   /* in the ring, not the slot */
++#endif
+         uint32_t *lo = b->key.tnl ? &tv0 : &v0, *hi = b->key.tnl ? &tv1 : &v1;
+         if (b->first < *lo) *lo = b->first;
+         if (b->first + b->count > *hi) *hi = b->first + b->count;
+@@ -2353,23 +2696,60 @@ static int submit_range(Target *t, const Batch *arr, uint32_t b0, uint32_t b1) {
+     if (tv0 == UINT32_MAX) tv0 = tv1 = 0;
+     const uint32_t nverts = v1 - v0, ntverts = tv1 - tv0;
+     /* The parameter records the range's references name: those of the PRIMs it holds. */
+-    uint32_t p0 = UINT32_MAX, p1 = 0;
+-    for (uint32_t i = 0; ntverts && i < s_ntnlp; i++) {
++    uint32_t p0 = UINT32_MAX, p1 = 0, r0 = UINT32_MAX, r1 = 0, vr0 = UINT32_MAX, vr1 = 0;
++    for (uint32_t i = 0; ntverts && i < s_ntnlb; i++) {
+         if (s_tnl_box[i].end <= tv0 || s_tnl_box[i].first >= tv1) continue;
+-        if (i < p0) p0 = i;
+-        p1 = i + 1u;
++        if (s_tnl_box[i].param < p0) p0 = s_tnl_box[i].param;
++        if (s_tnl_box[i].param + 1u > p1) p1 = s_tnl_box[i].param + 1u;
++        if (s_tnl_box[i].raw0 < r0) r0 = s_tnl_box[i].raw0;
++        if (s_tnl_box[i].raw1 > r1) r1 = s_tnl_box[i].raw1;
++        if (s_tnl_box[i].vfirst < vr0) vr0 = s_tnl_box[i].vfirst;
++        if (s_tnl_box[i].vend > vr1) vr1 = s_tnl_box[i].vend;
+     }
+     if (p0 == UINT32_MAX) p0 = p1 = 0;
+-    if (!cmd_batch_begin_tnl(nverts, ntverts, p1)) return 0;
++    if (r0 == UINT32_MAX) r0 = r1 = 0;
++    if (vr0 == UINT32_MAX) vr0 = vr1 = 0;
++    /* ntverts counts indices; the vertex records are [vr0, vr1) */
++    if (!cmd_batch_begin_tnl_idx(nverts, vr1 - vr0, p1, (r1 - r0) + 4u, ntverts)) return 0;
++#ifdef SR_GE_NATIVE
++    for (int g = 0; g < 2; g++) {   /* the ring positions these draws read: this slot's until its fence */
++        if (s_ring_pending_lo[g] < s_cmd_slot->ring_lo[g]) s_cmd_slot->ring_lo[g] = s_ring_pending_lo[g];
++        s_ring_pending_lo[g] = UINT64_MAX;
++    }
++#endif
+     uint32_t vertex_base = s_cmd_slot->vused;
+     uint32_t tvertex_base = s_cmd_slot->tused;
+     /* Records go where their staged index plus a non-negative delta lands, and the delta is
+      * the draws' firstInstance, which psp_tnl.vert adds to each reference's index. */
+     uint32_t param_base = s_cmd_slot->pused > p0 ? s_cmd_slot->pused : p0;
++    uint32_t ibase = s_cmd_slot->iused;
+     uint64_t memcpy_started = cpu_profile_now();
+     memcpy(s_cmd_slot->vmap + vertex_base, s_vcpu + v0, (size_t)nverts * sizeof(GpuVert));
++#ifdef SR_GE_NATIVE
++    /* staged in this slot: drawn where it is */
++    const int in_place = ntverts && s_stage_slot == s_cmd_slot;
++    if (in_place) {
++        tvertex_base = s_sb_t + vr0;
++        param_base = s_sb_p + p0;
++        ibase = s_sb_i + tv0;
++    }
++    if (ntverts && !in_place) {
++#else
+     if (ntverts) {
+-        memcpy(s_cmd_slot->tmap + tvertex_base, s_tnl_vcpu + tv0, (size_t)ntverts * sizeof(GeTnlVtx));
++#endif
++        /* the raw bytes the range's corners name, into the slot's arena, and the corners moved by the same */
++        const uint32_t rbase = (s_cmd_slot->rused + 3u) & ~3u;
++        memcpy(s_cmd_slot->rmap + rbase, s_tnl_rcpu + r0, r1 - r0);
++        s_cmd_slot->rused = rbase + (r1 - r0);
++#ifdef SR_GE_NATIVE
++        const uint32_t rdelta = rbase - r0 - s_stage_rbias;   /* corners name the stage's slot offsets */
++#else
++        const uint32_t rdelta = rbase - r0;
++#endif
++        TnlCorner *dst = s_cmd_slot->tmap + tvertex_base;
++        const TnlCorner *src = s_tnl_vcpu + vr0;
++        for (uint32_t i = 0; i < vr1 - vr0; i++) { dst[i].off = src[i].off + rdelta; dst[i].param = src[i].param; }
++        memcpy(s_cmd_slot->imap + s_cmd_slot->iused, s_tnl_icpu + tv0, (size_t)ntverts * sizeof(uint32_t));
+         memcpy(s_cmd_slot->pmap + param_base, s_tnl_pcpu + p0, (size_t)(p1 - p0) * sizeof(GeTnlParams));
+     }
+     if (s_cpu_profile) {
+@@ -2385,8 +2765,8 @@ static int submit_range(Target *t, const Batch *arr, uint32_t b0, uint32_t b1) {
+                         s_cpu_profile_stats.phase[GEGPU_CPU_BIND_RECORD].ns;
+ 
+     VkDeviceSize vertex_offset = (VkDeviceSize)vertex_base * sizeof(GpuVert);
+-    VkDeviceSize tvertex_offset = (VkDeviceSize)tvertex_base * sizeof(GeTnlVtx);
+-    RangeRec rr = { arr, b0, b1, v0, tv0, p0, param_base, ntverts, vertex_offset, tvertex_offset };
++    VkDeviceSize tvertex_offset = (VkDeviceSize)tvertex_base * sizeof(TnlCorner);
++    RangeRec rr = { arr, b0, b1, v0, tv0, p0, param_base, ntverts, vertex_offset, tvertex_offset, vr0, ibase };
+     /* The host twin's pass draws on the twin's copy of what this op starts from: a twin that
+      * is behind (some write did not reach it) is first re-seeded from the authentic image. */
+     int twin_pass = s_twin && t->tfb && t->dep && t->dep->timg;
+@@ -2425,8 +2805,19 @@ static int submit_range(Target *t, const Batch *arr, uint32_t b0, uint32_t b1) {
+     s_replay_stats.batches += b1 - b0;
+     s_replay_stats.draws += b1 - b0;
+     s_cmd_slot->vused += nverts;
+-    s_cmd_slot->tused += ntverts;
++#ifdef SR_GE_NATIVE
++    if (in_place) {   /* the cursors past what this op drew */
++        if (s_cmd_slot->tused < s_sb_t + vr1) s_cmd_slot->tused = s_sb_t + vr1;
++        if (s_cmd_slot->iused < s_sb_i + tv1) s_cmd_slot->iused = s_sb_i + tv1;
++        if (s_cmd_slot->pused < s_sb_p + p1) s_cmd_slot->pused = s_sb_p + p1;
++        if (s_cmd_slot->rused < s_sb_r + r1) s_cmd_slot->rused = s_sb_r + r1;
++    } else
++#endif
++    {
++    s_cmd_slot->tused += vr1 - vr0;   /* vertex records; the indices: */
++    s_cmd_slot->iused += ntverts;
+     if (ntverts) s_cmd_slot->pused = param_base + (p1 - p0);
++    }
+     int ok = cmd_batch_record(SR_PERF_GE_RENDER_BATCH);
+     t->gpu_valid = 1;
+     t->render_gen++;
+@@ -2468,38 +2859,23 @@ static int submit_range(Target *t, const Batch *arr, uint32_t b0, uint32_t b1) {
+  * built held; every other shader-blend batch reads the snapshot unchanged, because nothing drawn
+  * since its copy touches the pixels it reads. Leaves the color image SHADER_READ_ONLY. */
+ static int submit_list(Target *t, const Batch *arr, uint32_t n) {
+-    int ok = 1;
+-    uint32_t i = 0;
+-    while (ok && i < n) {
+-        SnapRect box = batch_rect(&arr[i]);
+-        if (batch_reads_dst(&arr[i])) {
+-            if (snapshot_stale_for(t, &box, &k_snap_rect_empty)) {
+-                if (!snapshot_copy_op(t)) { ok = 0; break; }
+-            } else if (sr_perf_enabled) {
+-                sr_perf_ge_event(SR_PERF_GE_SNAPSHOT_CACHE_HIT, 1);
+-            }
+-        }
+-        SnapRect drawn = box;
+-        uint32_t j = i + 1u;
+-        for (; j < n; j++) {
+-            box = batch_rect(&arr[j]);
+-            if (batch_reads_dst(&arr[j])) {
+-                if (snapshot_stale_for(t, &box, &drawn)) break;
+-                if (sr_perf_enabled) sr_perf_ge_event(SR_PERF_GE_SNAPSHOT_CACHE_HIT, 1);
+-            }
+-            snap_rect_union(&drawn, &box);
+-        }
+-        const int tracked = s_snap_src == t && s_snap_tracked && s_snap_dirty_gen == t->render_gen;
+-        ok = submit_range(t, arr, i, j);
+-        target_note_drawn(t, drawn.y0, drawn.y1);
+-        if (ok && tracked) {
+-            /* Outside what this op drew, the snapshot still holds the target. */
+-            snap_rect_union(&s_snap_dirty, &drawn);
+-            s_snap_dirty_gen = t->render_gen;
+-            s_snap_srcgen = snap_rect_empty(&s_snap_dirty) ? t->render_gen : 0;
+-        }
+-        i = j;
++    /* one render op for every batch: a batch reading the destination reads the target itself (record_range's
++     * barriers), so nothing splits the pass and no copy is taken */
++    if (!n) return 1;
++#ifdef SR_GE_NATIVE
++    /* every row counts as drawn (it only bounds a later read of the target back to guest VRAM, which a native
++     * module doesn't do): no box of every PRIM walked at each submission */
++    SnapRect drawn = { 0, 0, FB_W, FB_H };
++#else
++    SnapRect drawn = batch_rect(&arr[0]);
++    for (uint32_t j = 1; j < n; j++) {
++        const SnapRect box = batch_rect(&arr[j]);
++        snap_rect_union(&drawn, &box);
+     }
++#endif
++    const int ok = submit_range(t, arr, 0, n);
++    target_note_drawn(t, drawn.y0, drawn.y1);
++    if (s_snap_src == t) s_snap_tracked = 0;   /* the self-texturing snapshot no longer follows what was drawn */
+     return ok;
+ }
+ 
+@@ -2563,6 +2939,14 @@ static void stats_tick(void) { stats_emit(0); }
+ static int target_sync_cpu_writes(Target *t);
+ 
+ static int target_readback(Target *t) {
++    /* (dev, DSP_RB_LOG=1) who asks for a readback: the caller's offset from this function, the first 40 times */
++    static int rblog = -1, rbn;
++    if (rblog < 0) rblog = getenv("DSP_RB_LOG") != NULL;
++    if (rblog && rbn < 40 && t->gpu_valid && t->clean_gen != t->render_gen) {
++        rbn++;
++        fprintf(stderr, "RBLOG caller %+ld fba=0x%x fmt=%u\n",
++                (long)((const char *)__builtin_return_address(0) - (const char *)(void *)target_readback), t->fba, t->fmt);
++    }
+     if (!t->gpu_valid) return 1;
+     if (!target_sync_cpu_writes(t)) return 0;
+     if (!t->gpu_valid) return 1;
+@@ -2642,10 +3026,25 @@ static int target_prepare_present(Target *t) {
+     }
+     /* Presentation/readback command buffers are submitted outside the GE slot ring.
+      * Close the GE chain first so their same-queue order reflects program order. */
++#ifdef SR_GE_NATIVE
++    /* the target's move to TRANSFER_SRC recorded into the frame's own GE command buffer, before it
++     * goes: one submission a frame for the GE, not a second with its own fence for this barrier (each costs the driver's kernel
++     * sync calls, ~30 microseconds each on the Brick) */
++    if (t->layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
++        if (!cmd_batch_begin(0)) return 0;
++        to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        s_cmd_slot->reason_mask |= 1u << SR_PERF_GE_TARGET_READBACK_TRANSITION;
++        s_cmd_slot->recorded_ops++;
++    }
++#endif
+     if (!cmd_batch_flush()) return 0;
+     readback_poll();
+ 
++#ifdef SR_GE_NATIVE
++    const int copy = 0;   /* a presented frame is not copied back into guest VRAM */
++#else
+     int copy = t->clean_gen != t->render_gen;
++#endif
+     if (t->layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && !copy) return 1;
+     if (copy) {
+         for (int i = 0; i < READBACK_FRAMES; i++) {
+@@ -2748,7 +3147,8 @@ static int target_upload(Target *t) {
+     VkBufferImageCopy c = {0};
+     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     c.imageSubresource.layerCount = 1;
+-    c.imageExtent.width = SCL_W; c.imageExtent.height = SCL_H; c.imageExtent.depth = 1;
++    c.imageOffset.y = s_vpad * s_scale;   /* the guest's rows */
++    c.imageExtent.width = SCL_W; c.imageExtent.height = (uint32_t)(FB_H * s_scale); c.imageExtent.depth = 1;
+     c.bufferOffset = upload.offset;
+     vkCmdCopyBufferToImage(s_cmd, upload.buffer, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+     to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
+@@ -2787,7 +3187,7 @@ static int target_read_dirty_edges(Target *t, DirtyEdgePixel *edges, uint32_t co
+         copies[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         copies[i].imageSubresource.layerCount = 1;
+         copies[i].imageOffset.x = (int32_t)(edges[i].x * (uint32_t)s_scale);
+-        copies[i].imageOffset.y = (int32_t)(edges[i].y * (uint32_t)s_scale);
++        copies[i].imageOffset.y = (int32_t)((edges[i].y + (uint32_t)s_vpad) * (uint32_t)s_scale);
+         copies[i].imageExtent.width = 1;
+         copies[i].imageExtent.height = 1;
+         copies[i].imageExtent.depth = 1;
+@@ -2915,7 +3315,7 @@ static int target_patch_vram_dirty(Target *t, uint32_t dirty_addr, uint32_t dirt
+         copies[ci].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         copies[ci].imageSubresource.layerCount = 1;
+         copies[ci].imageOffset.x = (int32_t)(x0 * (uint32_t)s_scale);
+-        copies[ci].imageOffset.y = (int32_t)(y * (uint32_t)s_scale);
++        copies[ci].imageOffset.y = (int32_t)((y + (uint32_t)s_vpad) * (uint32_t)s_scale);
+         copies[ci].imageExtent.width = scaled_width;
+         copies[ci].imageExtent.height = (uint32_t)s_scale;
+         copies[ci].imageExtent.depth = 1;
+@@ -3198,6 +3598,7 @@ static void target_destroy(Target *t) {
+     if (t->fb) vkDestroyFramebuffer(s_dev, t->fb, NULL);
+     for (unsigned i = 0; i < TEX_FILTER_VARIANTS; i++)
+         if (t->set[i]) vkFreeDescriptorSets(s_dev, s_dpool_fix, 1, &t->set[i]);
++    target_inset_free(t);
+     if (t->view) vkDestroyImageView(s_dev, t->view, NULL);
+     if (t->img) vkDestroyImage(s_dev, t->img, NULL);
+     if (t->mem) vkFreeMemory(s_dev, t->mem, NULL);
+@@ -3299,7 +3700,8 @@ static int depth_from_cpu(DepthEnt *d) {
+     VkBufferImageCopy c = {0};
+     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+     c.imageSubresource.layerCount = 1;
+-    c.imageExtent.width = SCL_W; c.imageExtent.height = SCL_H; c.imageExtent.depth = 1;
++    c.imageOffset.y = s_vpad * s_scale;   /* the guest's rows */
++    c.imageExtent.width = SCL_W; c.imageExtent.height = (uint32_t)(FB_H * s_scale); c.imageExtent.depth = 1;
+     c.bufferOffset = upload.offset;
+     vkCmdCopyBufferToImage(s_cmd, upload.buffer, d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+     to_layout(s_cmd, d->img, VK_IMAGE_ASPECT_DEPTH_BIT, &d->layout,
+@@ -4492,7 +4894,81 @@ static void tex_xs_retry(TexEnt *e, uint32_t levels) {
+     tex_xs_offer(e, e->hash, levels);
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* The lookup's last answer, reused while the texture state it read, the list run and the
++ * CLUT loads are the same and no texture was invalidated or replaced since: an object's PRIMs, one texture, one lookup (not the
++ * content hash, the palette hash and the cache scan again for each). A texture the CPU rewrites mid-run is the PSP's race too. */
++typedef struct {
++    uint32_t addr, bufw, fmt, wrap, filter, variant, swz, clutfmt, maxl, lmode, run, clut, inval, noscale, twin, w, h;
++    float bias;
++    uint32_t maddr[7], mbufw[7];
++    uint8_t mw[7], mh[7];
++} TexSnap;
++static TexSnap s_tex_snap;
++#define TEX_INDEX 2048u
++static int s_tex_index[TEX_INDEX];   /* entry index + 1 by key hash; rebuilt when an entry's key changes */
++static void tex_index_note(int i) {
++    uint32_t h = (uint32_t)((s_tex[i].key ^ (s_tex[i].key >> 29)) * 0x9E3779B97F4A7C15ull >> 52) & (TEX_INDEX - 1u);
++    for (uint32_t probe = 0; probe < TEX_INDEX; probe++, h = (h + 1u) & (TEX_INDEX - 1u))
++        if (!s_tex_index[h] || s_tex_index[h] == i + 1) { s_tex_index[h] = i + 1; return; }
++}
++static int s_tex_snap_ok;
++static TexEnt *s_tex_last_e;
++static uint32_t s_tex_last_levels;
++static uint32_t s_tex_inval_gen;
++static void tex_snap_now(TexSnap *t) {
++    const GeState *g = s_ge;
++    memset(t, 0, sizeof(*t));
++    t->addr = g->tex_addr; t->bufw = g->tex_bufw; t->fmt = g->tex_fmt; t->wrap = g->tex_wrap; t->filter = g->tex_filter;
++    t->variant = tex_filter_variant(g->tex_filter); t->swz = (uint32_t)g->tex_swizzle; t->clutfmt = g->clut_fmt;
++    t->maxl = g->tex_max_level; t->lmode = g->tex_level_mode; t->bias = g->tex_lod_bias;
++    t->run = g_ge_run_gen; t->clut = g_ge_clut_gen; t->inval = s_tex_inval_gen; t->noscale = (uint32_t)s_tex_noscale;
++    t->twin = (uint32_t)s_twin; t->w = (uint32_t)g->tex_w; t->h = (uint32_t)g->tex_h;
++    for (int i = 0; i < 7; i++) {
++        t->maddr[i] = g->tex_mip_addr[i]; t->mbufw[i] = g->tex_mip_bufw[i];
++        t->mw[i] = g->tex_mip_wlog2[i]; t->mh[i] = g->tex_mip_hlog2[i];
++    }
++}
++static VkDescriptorSet tex_get_full(void);
+ static VkDescriptorSet tex_get(void) {
++    TexSnap now;
++    tex_snap_now(&now);
++    static int hist = -1;
++    static uint64_t fast, full, said_at;
++    if (hist < 0) hist = getenv("DSP_GECMDHIST") != NULL;
++    if (hist) {
++        const uint64_t t = SDL_GetTicksNS();
++        if (!said_at) said_at = t;
++        if (t - said_at > 4000000000ull) {
++            fprintf(stderr, "TEXHIST: %llu lookups reused, %llu full, %d textures cached\n", (unsigned long long)fast,
++                    (unsigned long long)full, s_tex_n);
++            fast = full = 0;
++            said_at = t;
++        }
++    }
++    if (s_tex_snap_ok && !xs_enabled() && memcmp(&now, &s_tex_snap, sizeof(now)) == 0) {
++        fast++;
++        s_tex_bound_scale = 1;
++        s_tex_last_e->lru = s_texlru++;
++        s_tex_last_e->pending = 1;
++        return tex_bind_set(s_tex_last_e, s_tex_last_levels);
++    }
++    s_tex_snap_ok = 0;
++    s_tex_last_e = NULL;
++    full++;
++    const VkDescriptorSet set = tex_get_full();
++    if (s_tex_last_e) {
++        tex_snap_now(&s_tex_snap);
++        s_tex_snap_ok = 1;
++    }
++    return set;
++}
++#define TEX_RETURN_ENTRY(e, levels) do { s_tex_last_e = (e); s_tex_last_levels = (levels); return tex_bind_set((e), (levels)); } while (0)
++static VkDescriptorSet tex_get_full(void) {
++#else
++#define TEX_RETURN_ENTRY(e, levels) return tex_bind_set((e), (levels))
++static VkDescriptorSet tex_get(void) {
++#endif
+     s_tex_bound_scale = 1;
+     tex_xs_collect();
+     int w = s_ge->tex_w, h = s_ge->tex_h;
+@@ -4513,6 +4989,9 @@ static VkDescriptorSet tex_get(void) {
+     TexMipKey mip;
+     uint32_t mip_bytes[7] = {0};
+     tex_mip_key(&mip);
++#ifdef SR_GE_NATIVE
++    if (mip.max_level && !tex_mip_chain_supported()) memset(&mip, 0, sizeof(mip));   /* level 0 only */
++#endif
+     if (mip.max_level) {
+         if (!tex_mip_chain_supported()) {
+             /* gpu_state_unsupported_reason() routes these states to the software rasterizer. */
+@@ -4523,20 +5002,53 @@ static VkDescriptorSet tex_get(void) {
+         tex_mip_targets_readback(&mip, mip_bytes);
+     }
+     uint32_t levels = mip.max_level + 1u;
++#ifdef SR_GE_NATIVE
++    /* The content hash (64 samples of the texture's bytes, a cache miss each) read once a GE run for
++     * an entry: within a run the guest's texture bytes are as the run found them (a stall's resume is a new run). */
++    uint64_t hash = 0;
++    int hashed = 0;
++#define TEX_HASH_NOW() do { if (!hashed) { hash = tex_hash(); if (mip.max_level) hash = tex_mip_hash(hash, &mip, mip_bytes); \
++                                           hashed = 1; } } while (0)
++#else
+     uint64_t hash = tex_hash();
+     if (mip.max_level) hash = tex_mip_hash(hash, &mip, mip_bytes);
++#define TEX_HASH_NOW() do { } while (0)
++#endif
+     uint64_t lookup_started = cpu_profile_now();
++#ifdef SR_GE_NATIVE
++    /* the entry for this key from a hashed index (an entry's key in s_tex_key_of): one probe
++     * sequence, not a scan of the whole cache (~400 entries, ~140 lookups a frame); the scan below then starts at it */
++    int tex_from = 0;
++    {
++        uint32_t h = (uint32_t)((key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull >> 52) & (TEX_INDEX - 1u);
++        for (uint32_t probe = 0; probe < TEX_INDEX && s_tex_index[h]; probe++, h = (h + 1u) & (TEX_INDEX - 1u)) {
++            const int i = s_tex_index[h] - 1;
++            if (i < s_tex_n && s_tex[i].key == key && memcmp(&s_tex[i].mip, &mip, sizeof(mip)) == 0) { tex_from = i; break; }
++        }
++    }
++    for (int i = tex_from; i < s_tex_n; i++) {
++#else
+     for (int i = 0; i < s_tex_n; i++) {
++#endif
+         TexEnt *e = &s_tex[i];
+         if (e->key != key || memcmp(&e->mip, &mip, sizeof(mip)) != 0) continue;
+         cpu_profile_add(GEGPU_CPU_OBJECT_LOOKUP, lookup_started);
+         if (s_cpu_profile) s_cpu_profile_stats.texture_hits++;
+         e->lru = s_texlru++;
++#ifdef SR_GE_NATIVE
++        if (e->content_valid && e->hash_run == g_ge_run_gen + 1u) {   /* hashed in this run */
++            e->pending = 1;
++            if (xs_enabled()) tex_xs_retry(e, levels);
++            TEX_RETURN_ENTRY(e, levels);
++        }
++        TEX_HASH_NOW();
++        e->hash_run = g_ge_run_gen + 1u;
++#endif
+         if (e->content_valid && e->hash == hash) {
+             if (sr_perf_enabled) sr_perf_texture_cache(1);
+             e->pending = 1;
+             if (xs_enabled()) tex_xs_retry(e, levels);
+-            return tex_bind_set(e, levels);
++            TEX_RETURN_ENTRY(e, levels);
+         }
+         if (!e->content_valid && e->hash == hash && tex_shadow_matches(e)) {
+             e->content_valid = 1;
+@@ -4545,15 +5057,21 @@ static VkDescriptorSet tex_get(void) {
+             s_cnt_shadow_avoided++;
+             if (sr_perf_enabled) sr_perf_texture_cache(1);
+             if (xs_enabled()) tex_xs_retry(e, levels);
+-            return tex_bind_set(e, levels);
++            TEX_RETURN_ENTRY(e, levels);
+         }
+         /* same texture state, new contents: update in place (cache stays bounded) */
++#ifdef SR_GE_NATIVE
++        s_tex_inval_gen++;
++#endif
+         if (e->pending) submit_pending();
+         if (!e->content_valid) s_cnt_shadow_required++;
+         if (!tex_decode_upload(e->img, e->w, e->h, levels)) {
+             /* The image may be partly undefined now: with no valid mark and no shadow, the next
+              * lookup decodes again, whatever the content hash says. */
+             e->content_valid = 0;
++#ifdef SR_GE_NATIVE
++            s_tex_inval_gen++;
++#endif
+             tex_shadow_release(e);
+             return s_white_set;
+         }
+@@ -4563,11 +5081,16 @@ static VkDescriptorSet tex_get(void) {
+         tex_shadow_store(e);
+         e->pending = 1;
+         s_cnt_texup++;
++        s_dev_texup++;
+         tex_xs_note_upload(e, levels);   /* s_texscratch still holds level 0 when levels == 1 */
+-        return tex_bind_set(e, levels);
++        TEX_RETURN_ENTRY(e, levels);
+     }
+ 
+     cpu_profile_add(GEGPU_CPU_OBJECT_LOOKUP, lookup_started);
++#ifdef SR_GE_NATIVE
++    s_tex_inval_gen++;   /* a new entry may take an old one's place */
++    s_dev_texnew++;
++#endif
+     if (s_cpu_profile) s_cpu_profile_stats.texture_misses++;
+ 
+     if (s_tex_n >= MAX_TEX) {
+@@ -4582,7 +5105,22 @@ static VkDescriptorSet tex_get(void) {
+     if (!tex_decode_upload(e->img, w, h, levels)) return s_white_set;
+     e->set = make_descriptor(e->view, e->smp, s_dpool_tex);
+     if (!e->set) return s_white_set;
++    TEX_HASH_NOW();
++#ifdef SR_GE_NATIVE
++    e->hash_run = g_ge_run_gen + 1u;
++#endif
+     e->key = key; e->hash = hash;
++#ifdef SR_GE_NATIVE
++    {   /* into the index; rebuilt from the live entries once stale slots pile up */
++        static int inserted;
++        if (++inserted > 1500) {
++            memset(s_tex_index, 0, sizeof(s_tex_index));
++            for (int j = 0; j < s_tex_n; j++) tex_index_note(j);
++            inserted = s_tex_n;
++        }
++        tex_index_note((int)(e - s_tex));
++    }
++#endif
+     e->w = w; e->h = h;
+     e->addr = s_ge->tex_addr;
+     e->bytes = tex_source_size();
+@@ -4598,7 +5136,7 @@ static VkDescriptorSet tex_get(void) {
+     s_cnt_texup++;
+     s_tex_n++;
+     tex_xs_note_upload(e, levels);   /* s_texscratch still holds level 0 when levels == 1 */
+-    return tex_bind_set(e, levels);
++    TEX_RETURN_ENTRY(e, levels);
+ }
+ 
+ /* ---- capture --------------------------------------------------------------------------- */
+@@ -4785,17 +5323,23 @@ static int blend_needs_shader(uint32_t sfp, uint32_t dfp, uint32_t eq, uint32_t
+  * (#1931). */
+ enum { SFIX_NONE = -1, SFIX_KEEP = -2 };
+ static int stencil_fixed_alpha(const GeState *g) {
+-    if ((g->fbfmt & 3u) != 3u || (g->stencil_test & 7u) != 1u) return SFIX_NONE;
++    /* with dual-source blending, 16-bit targets too: a 565 target has no stencil bits (KEEP), a 5551 or 4444 one
++     * stores the constant on its lattice; and a blended draw may store any constant, not only 0 */
++    const uint32_t fmt = g->fbfmt & 3u;
++    if ((g->stencil_test & 7u) != 1u || (fmt != 3u && !dual_src_on())) return SFIX_NONE;
++    if (fmt == 0u) return SFIX_KEEP;
+     const int blended = g->blend_enable != 0;
+-    if (blended && (g->dither_enable ||
++    if (blended && ((g->dither_enable && exact_blend16()) ||
+                     blend_needs_shader(g->blend_mode & 0xFu, (g->blend_mode >> 4) & 0xFu,
+                                        (g->blend_mode >> 8) & 7u, g->blend_fixa, g->blend_fixb)))
+         return SFIX_NONE;
+     const uint32_t amask = (uint32_t)g->mask_alpha & 0xFFu, zpass = (g->stencil_op >> 16) & 7u;
+     if (zpass == 0u || amask == 0xFFu) return SFIX_KEEP;
+     if (amask != 0u) return SFIX_NONE;
+-    const int value = zpass == 1u ? 0 : zpass == 2u ? (int)((g->stencil_test >> 8) & 0xFFu) : -1;
+-    if (value < 0 || (blended && value != 0)) return SFIX_NONE;
++    int value = zpass == 1u ? 0 : zpass == 2u ? (int)((g->stencil_test >> 8) & 0xFFu) : -1;
++    if (value < 0 || (blended && value != 0 && !dual_src_on())) return SFIX_NONE;
++    if (fmt == 1u) value = (value & 0x80) ? 255 : 0;          /* 5551: the stencil's top bit */
++    else if (fmt == 2u) value = (value >> 4) * 17;            /* 4444: its top four bits */
+     return value;
+ }
+ 
+@@ -4834,6 +5378,9 @@ static void build_state(int persp, int sprite, Batch *b) {
+     int sx2 = g->scis_x2 < FB_W - 1 ? g->scis_x2 : FB_W - 1;
+     int sy2 = g->scis_y2 < FB_H - 1 ? g->scis_y2 : FB_H - 1;
+     if (sx1 > sx2 || sy1 > sy2) { b->sw = 0; return; }   /* nothing drawable */
++    if (s_vpad && sy1 == 0 && sy2 == FB_H - 1 && g->scis_y1 <= 0 && g->scis_y2 >= FB_H - 1) {
++        sy1 = -s_vpad; sy2 = FB_H - 1 + s_vpad;   /* the whole PSP screen: the rows above and below too */
++    }
+     b->sx = sx1; b->sy = sy1; b->sw = sx2 - sx1 + 1; b->sh = sy2 - sy1 + 1;
+ 
+     /* color write mask (partial-byte masks approximate: >= 0x80 disables the channel) */
+@@ -4871,9 +5418,31 @@ static void build_state(int persp, int sprite, Batch *b) {
+         int dual_fix = blend_dual_fix(sfp, dfp, g->blend_fixa, g->blend_fixb);
+         /* A stencil-fail pixel keeps its colour, and the stored alpha is the stencil, not a
+          * blend result: with the stencil test on, the shader blends too. */
+-        shblend = stencil || (g->fbfmt & 3) != 3 || (g->dither_enable != 0) ||
++        /* a 16-bit framebuffer and dither+blend blend in fixed function, as PPSSPP does: the
++         * PSP's rounding of the blend result to 5/6 bits and its dither are left out, and with them a destination snapshot and a
++         * submission for every blended draw. SR_GPU_EXACT_BLEND16=1: the runtime's exact shader blend for them. */
++        const int exact16 = exact_blend16();
++        shblend = stencil || (exact16 && ((g->fbfmt & 3) != 3 || (g->dither_enable != 0))) ||
+                   blend_needs_shader(sfp, dfp, eq, g->blend_fixa, g->blend_fixb);
+         if (shblend) {
++            /* (dev, DSP_SHBLEND_LOG=1) each distinct state that takes the shader blend, once */
++            static int shlog = -1;
++            if (shlog < 0) shlog = getenv("DSP_SHBLEND_LOG") != NULL;
++            if (shlog) {
++                static uint64_t seen[64];
++                static int nseen;
++                const uint64_t key = (uint64_t)stencil | ((uint64_t)(g->fbfmt & 3) << 1) | ((uint64_t)(g->dither_enable != 0) << 3) |
++                                     ((uint64_t)g->blend_mode << 4) | ((uint64_t)(g->stencil_test & 0xffffffu) << 20) |
++                                     ((uint64_t)(g->stencil_op & 0x70707u) << 44);
++                int known = 0;
++                for (int i = 0; i < nseen; i++) known |= seen[i] == key;
++                if (!known && nseen < 64) {
++                    seen[nseen++] = key;
++                    fprintf(stderr, "SHBLEND stencil=%d sfix=%d fbfmt=%u dither=%d blend=0x%x fixa=0x%06x fixb=0x%06x stest=0x%06x sop=0x%06x amask=0x%02x\n",
++                            stencil, sfix, g->fbfmt & 3u, g->dither_enable != 0, g->blend_mode, g->blend_fixa & 0xffffffu,
++                            g->blend_fixb & 0xffffffu, g->stencil_test & 0xffffffu, g->stencil_op & 0xffffffu, (uint32_t)g->mask_alpha & 0xffu);
++                }
++            }
+             if (sr_perf_enabled) sr_perf_ge_event(SR_PERF_GE_SHBLEND_STATE, 1);
+             if ((g->fbfmt & 3) != 3) {
+                 if (sr_perf_enabled) sr_perf_ge_event(SR_PERF_GE_SHBLEND_FB16, 1);
+@@ -4920,7 +5489,7 @@ static void build_state(int persp, int sprite, Batch *b) {
+                 case 1:  k->eq = VK_BLEND_OP_SUBTRACT; break;
+                 case 2:  k->eq = VK_BLEND_OP_REVERSE_SUBTRACT; break;
+                 case 3:  k->eq = VK_BLEND_OP_MIN; break;      /* exact: factors ignored */
+-                case 4:  k->eq = VK_BLEND_OP_MAX; break;      /* on the PSP and in VK  */
++                case 4:  k->eq = VK_BLEND_OP_MAX; break;      /* on the PSP and in VK */
+                 default: k->eq = VK_BLEND_OP_ADD; break;
+             }
+         }
+@@ -4952,6 +5521,7 @@ static void build_state(int persp, int sprite, Batch *b) {
+     if (clear) flags |= F_CLEAR;
+     if (persp && !(clear && sprite)) flags |= F_PERSP;   /* minz/maxz discard */
+     if (persp && g->fog_enable && !clear) flags |= F_FOG;
++    if (!g->shade_gouraud) flags |= F_FLAT;   /* the first vertex's colour: each path puts the PSP's provoking one first */
+     b->pc.texsize[0] = b->pc.texsize[1] = 1.0f;
+     if (textured) {
+         flags |= F_TEX;
+@@ -4972,7 +5542,20 @@ static void build_state(int persp, int sprite, Batch *b) {
+     }
+     /* Native 16-bit precision emulation: dither offset + lattice snap in the shader.
+      * The dither matrix rides in the push constants (one packed row per int). */
++#ifdef SR_GE_NATIVE
++    /* no ordered dither (as PPSSPP); its push-constant row carries the colour test, and
++     * the logic op goes to the pipeline: neither falls back to the CPU rasterizer */
++    if (!clear && g->color_test_enable) {
++        flags |= F_CTEST;
++        b->pc.dith[0] = (int32_t)(g->color_test & 3u);
++        b->pc.dith[1] = (int32_t)(g->color_ref & 0xFFFFFFu);
++        b->pc.dith[2] = (int32_t)(g->color_test_mask & 0xFFFFFFu);
++    }
++    if (!clear && g->logic_op_enable) k->logicop = (uint8_t)((g->logic_op & 15u) + 1u);
++    if (0) {
++#else
+     if (g->dither_enable) {
++#endif
+         flags |= F_DITHER;
+         for (int row = 0; row < 4; row++)
+             b->pc.dith[row] = (int32_t)((uint32_t)(uint8_t)g->dith[row][0]
+@@ -4987,13 +5570,23 @@ static void build_state(int persp, int sprite, Batch *b) {
+         flags |= F_STENCIL;
+         b->pc.bl[2] = (int32_t)(g->stencil_test & 0xFFFFFFu);
+         b->pc.bl[3] = (int32_t)((g->stencil_op & 0x070707u) | ((uint32_t)(g->mask_alpha & 0xFF) << 24));
+-    } else if (sfix >= 0 && k->blend_on) {
++    } else if (sfix >= 0 && k->blend_on && (sfix == 0 || !dual_src_on())) {
+         k->azero = 1;                     /* stencil_fixed_alpha: blended, the constant is 0 */
++    } else if (sfix >= 0 && k->blend_on) {
++        flags |= F_SALPHA;                /* blended, another constant: output 0's alpha, stored as it is */
++        b->pc.bl[2] = sfix;
++        k->astore = 1;
+     } else if (sfix >= 0) {
+         flags |= F_SALPHA;
+         b->pc.bl[2] = sfix;
+     }
+     if (sfix != SFIX_NONE) s_replay_stats.stencil_fixed++;
++    /* a fixed-function blend on a 16-bit target, or one storing a constant stencil: the colour factors read output
++     * 1's alpha, the source's own, unsnapped */
++    if (k->blend_on && !shblend && dual_src_on() && ((g->fbfmt & 3) != 3 || k->astore)) {
++        k->dualsrc = 1;
++        flags |= F_DUALSRC;
++    }
+ 
+     b->pc.cfg[1] = (int32_t)(((!clear && g->atest_enable) ? (g->atest & 0xFFFFFFu) : 1u /* ALWAYS */) |
+                              (lodcfg << 24));
+@@ -5068,9 +5661,9 @@ static void build_state(int persp, int sprite, Batch *b) {
+                 }
+                 /* texel coords map 1:1 onto the 512x272 image, shifted by the sub-rect */
+                 b->pc.texsize[0] = (float)FB_W;
+-                b->pc.texsize[1] = (float)FB_H;
++                b->pc.texsize[1] = (float)FB_HT;   /* the image's rows; the guest's start at s_vpad */
+                 b->pc.texsize[2] = (float)(pix % src->stride);
+-                b->pc.texsize[3] = (float)(pix / src->stride);
++                b->pc.texsize[3] = (float)(pix / src->stride + (uint32_t)s_vpad);
+             } else {
+                 /* incompatible stride/format reinterpretation, or mip levels: VRAM + decoder.
+                  * A render target is drawn as the GE drew it: never from a scaled copy. */
+@@ -5099,7 +5692,12 @@ static void build_state(int persp, int sprite, Batch *b) {
+         if (s_cpu_profile) s_cpu_profile_stats.snapshot_requests++;
+         if (sr_perf_enabled) sr_perf_ge_event(SR_PERF_GE_SNAPSHOT_REQUEST, 1);
+     }
++    /* the depth-range test only for a range narrower than the whole: none of the draws in full range can discard */
++    if ((flags & F_PERSP) && g->minz == 0u && g->maxz >= 65535u) flags &= ~F_PERSP;
+     b->pc.cfg[0] = (int32_t)((g->tex_func & 7) | ((uint32_t)flags << 8));
++    b->key.dstread = (flags & (F_SHBLEND | F_STENCIL)) != 0;
++    b->key.discards = (flags & (F_PERSP | F_CTEST | F_STENCIL | F_CLEAR)) != 0 || (((uint32_t)b->pc.cfg[1]) & 7u) != 1u;
++    b->key.fcfg = (uint32_t)b->pc.cfg[0];
+ }
+ 
+ /* ---- built-state template (state rebuilt per CHANGE, not per primitive) ------------------ */
+@@ -5173,6 +5771,7 @@ static void state_get(int persp, int sprite, Batch *out) {
+     if (s_tmpl_ok && serial == s_snapst_serial && s_snapst.persp == persp &&
+         s_snapst.sprite == sprite && s_snapst.flushgen == s_flushgen) {
+         *out = s_tmpl;
++        out->tparam = 0;
+         if (s_cpu_profile) s_cpu_profile_stats.state_cache_hits++;
+         cpu_profile_add(GEGPU_CPU_STATE_PREP, prep_started);
+         return;
+@@ -5195,6 +5794,7 @@ static void state_get(int persp, int sprite, Batch *out) {
+     snap_fill(&s_snapst, persp, sprite);  /* re-fill: build_state may have submitted */
+     s_snapst_serial = serial;             /* build_state runs no GE command */
+     s_tmpl_ok = 1;
++    s_tmpl.tparam = 0;
+     *out = s_tmpl;
+     if (s_cpu_profile) {
+         /* Count one state-preparation operation per state_get(), not one per timed
+@@ -5240,7 +5840,7 @@ static void append_wing(Batch *b, uint32_t first, uint32_t count) {
+             !memcmp(&last->key, &b->key, sizeof(b->key)) &&
+             last->sx == b->sx && last->sy == b->sy && last->sw == b->sw && last->sh == b->sh &&
+             !memcmp(last->bconst, b->bconst, sizeof(b->bconst)) &&
+-            !memcmp(&last->pc, &b->pc, sizeof(b->pc)) && last->dset == b->dset) {
++            !memcmp(&last->pc, &b->pc, sizeof(b->pc)) && last->dset == b->dset && last->tparam == b->tparam) {
+             last->count += count;
+             return;
+         }
+@@ -5268,7 +5868,7 @@ static void append(Batch *b, uint32_t first, uint32_t count) {
+             !memcmp(&last->key, &b->key, sizeof(b->key)) &&
+             last->sx == b->sx && last->sy == b->sy && last->sw == b->sw && last->sh == b->sh &&
+             !memcmp(last->bconst, b->bconst, sizeof(b->bconst)) &&
+-            !memcmp(&last->pc, &b->pc, sizeof(b->pc)) && last->dset == b->dset) {
++            !memcmp(&last->pc, &b->pc, sizeof(b->pc)) && last->dset == b->dset && last->tparam == b->tparam) {
+             if (!self_dep || !snap_rect_overlap(&s_tail_prims, &prim)) {
+                 last->count += count;
+                 if (self_dep) snap_rect_union(&s_tail_prims, &prim);
+@@ -5322,6 +5922,14 @@ static int stencil_gpu_supported(void) {
+ }
+ 
+ static int gpu_state_unsupported_reason(void) {
++#ifdef SR_GE_NATIVE
++    /* stencil ops the shader can't apply exactly (the depth-fail op) are left out, colour test and logic op
++     * are the GPU's, a partial write mask keeps or drops whole channels, mips past one chain sample what the chain holds: only a
++     * framebuffer the targets can't hold is the CPU's */
++    if (!is_vram(s_ge->fbp)) return GEGPU_FALLBACK_RAM_FB;
++    if ((s_ge->fbw ? s_ge->fbw : 512u) > FB_W) return GEGPU_FALLBACK_WIDE_STRIDE;
++    return -1;
++#endif
+     if (!stencil_gpu_supported()) return GEGPU_FALLBACK_STENCIL;
+     if (s_ge->color_test_enable) return GEGPU_FALLBACK_COLOR_TEST;
+     if (s_ge->logic_op_enable) return GEGPU_FALLBACK_LOGIC_OP;
+@@ -5338,8 +5946,26 @@ static int gpu_state_unsupported_reason(void) {
+ /* `forced` is the reason a primitive kind always falls back (lines, points), or -1 for one
+  * that falls back only under an unsupported state. */
+ static int software_fallback_begin(int forced) {
++#ifdef SR_GE_NATIVE
++    (void)forced;   /* lines and points are the GPU's quads */
++    const int reason = gpu_state_unsupported_reason();
++#else
+     const int reason = forced >= 0 ? forced : gpu_state_unsupported_reason();
++#endif
+     if (reason < 0) return 0;
++    {
++        /* (dev, DSP_FALLBACK_LOG=1) software fallbacks by reason, every 2,000 */
++        static int fblog = -1;
++        static unsigned long fbn[GEGPU_FALLBACK_REASONS], fbtotal;
++        if (fblog < 0) fblog = getenv("DSP_FALLBACK_LOG") != NULL;
++        if (fblog) {
++            fbn[reason]++;
++            if (++fbtotal % 100u == 0u)
++                fprintf(stderr, "FALLBACK %lu: stencil %lu colortest %lu logicop %lu writemask %lu ramfb %lu widestride %lu mips %lu line %lu point %lu (fbp 0x%x fbw %u stest 0x%x sop 0x%x z %u)\n",
++                        fbtotal, fbn[0], fbn[1], fbn[2], fbn[3], fbn[4], fbn[5], fbn[6], fbn[7], fbn[8], s_ge->fbp, s_ge->fbw,
++                        s_ge->stencil_test, s_ge->stencil_op, s_ge->ztest);
++        }
++    }
+     s_replay_stats.fallback_prims++;
+     if (s_nbatch&&!submit_pending()) return 1;
+ 
+@@ -5449,6 +6075,7 @@ static void wing_release(WingEnt *w) {
+     (void)cmd_drain(GEGPU_BOUNDARY_LIFETIME);
+     if (s_snap_src == &w->t) s_snap_src = NULL;
+     if (w->t.fb) vkDestroyFramebuffer(s_dev, w->t.fb, NULL);
++    target_inset_free(&w->t);
+     if (w->t.view) vkDestroyImageView(s_dev, w->t.view, NULL);
+     if (w->t.img) vkDestroyImage(s_dev, w->t.img, NULL);
+     if (w->t.mem) vkFreeMemory(s_dev, w->t.mem, NULL);
+@@ -5579,6 +6206,44 @@ static int hook_tri(const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
+     cpu_profile_hook_enter();
+     { const GeVtx *vv[3] = { A, B, C };
+       if (!hook_finite(vv, 3)) return cpu_profile_hook_leave(1); }
++    /* the module's say over a 2D (through-mode) triangle too, as over a sprite */
++    GeVtx t0, t1, t2;
++    float tri_dy = 0.0f;   /* the module's move, and whether it keeps Vert+'s rows for the triangle */
++    int tri_extend = 0;
++    if (sdk_sprite_draw && ((s_ge->vtype >> 23) & 1u) && !s_ge->clear) {   /* a clear is no layout's: never moved */
++        SdkSpriteDraw d = { s_ge->tex_addr, s_ge->tex_enable, 1, fminf(A->x, fminf(B->x, C->x)), fminf(A->y, fminf(B->y, C->y)),
++                            fmaxf(A->x, fmaxf(B->x, C->x)), fmaxf(A->y, fmaxf(B->y, C->y)), 0.0f, 0,
++                            fminf(A->u, fminf(B->u, C->u)), fminf(A->v, fminf(B->v, C->v)), fmaxf(A->u, fmaxf(B->u, C->u)),
++                            fmaxf(A->v, fmaxf(B->v, C->v)), s_ge->tex_w, s_ge->tex_h, 0, 0 };
++        sdk_sprite_draw(&d);
++        if (d.skip) return cpu_profile_hook_leave(1);
++        tri_dy = d.dy;
++        tri_extend = d.extend;
++        if (d.dy != 0.0f) {
++            t0 = *A; t1 = *B; t2 = *C; t0.y += d.dy; t1.y += d.dy; t2.y += d.dy; A = &t0; B = &t1; C = &t2;
++        }
++    }
++    /* Vert+ for a 2D triangle the module leaves in place: an untextured one over the whole height (a fade) reaches the
++     * rows above and below, any other keeps the PSP's rows (see hook_sprite) */
++    int vpad_psp_rows = 0;
++    if (s_vpad && tri_dy == 0.0f && !tri_extend && ((s_ge->vtype >> 23) & 1u)) {
++        const float y0 = fminf(A->y, fminf(B->y, C->y)), y1 = fmaxf(A->y, fmaxf(B->y, C->y));
++        const float tu = fmaxf(A->u, fmaxf(B->u, C->u)) - fminf(A->u, fminf(B->u, C->u));
++        const float tv_ = fmaxf(A->v, fmaxf(B->v, C->v)) - fminf(A->v, fminf(B->v, C->v));
++        const float tw = fmaxf(A->x, fmaxf(B->x, C->x)) - fminf(A->x, fminf(B->x, C->x));
++        const int fill = !s_ge->tex_enable || s_ge->clear || (tu * 8.0f <= tw && tv_ * 8.0f <= y1 - y0);
++        if (fill && y0 <= 0.0f && y1 >= (float)FB_H) {
++            t0 = *A; t1 = *B; t2 = *C;
++            GeVtx *tv[3] = { &t0, &t1, &t2 };
++            for (int k = 0; k < 3; k++) {
++                if (tv[k]->y <= 0.0f) tv[k]->y -= (float)s_vpad;
++                else if (tv[k]->y >= (float)FB_H) tv[k]->y += (float)s_vpad;
++            }
++            A = &t0; B = &t1; C = &t2;
++        } else {
++            vpad_psp_rows = 1;
++        }
++    }
+     Batch b;
+     if (__builtin_expect(s_wing_dst != NULL, 0)) {
+         if (!wing_state(persp, 0, &b)) return cpu_profile_hook_leave(1);
+@@ -5601,6 +6266,7 @@ static int hook_tri(const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
+         s_tri_state.target = s_cur;
+         s_tri_state.batch = b;
+     }
++    if (vpad_psp_rows && b.sy < 0) { b.sy = 0; b.sh = FB_H; }
+     const int s2d = smart2d_candidate(&b), xs1 = xs_onetoone_candidate(&b);
+     if (s2d || xs1) {
+         const float x[3] = { A->x, B->x, C->x }, y[3] = { A->y, B->y, C->y };
+@@ -5638,31 +6304,153 @@ static int hook_tri(const GeVtx *A, const GeVtx *B, const GeVtx *C, int persp) {
+ /* GPU transform and lighting (#318). The arenas exist only once a PRIM has arrived: the
+  * route is opt-in, and a default run allocates nothing for it. */
+ static int tnl_alloc(void) {
+-    s_tnl_vcpu = (GeTnlVtx *)malloc((size_t)MAX_TNL_VERTS * sizeof(GeTnlVtx));
++    s_tnl_vcpu = (TnlCorner *)malloc((size_t)MAX_TNL_VERTS * sizeof(TnlCorner));
++    s_tnl_rcpu = (uint8_t *)malloc(TNL_RAW_BYTES);
++    s_tnl_icpu = (uint32_t *)malloc((size_t)MAX_TNL_VERTS * sizeof(uint32_t));
++    if (!s_tnl_rcpu || !s_tnl_icpu) return 0;
+     s_tnl_pcpu = (GeTnlParams *)malloc((size_t)MAX_TNL_PARAMS * sizeof(GeTnlParams));
+     s_tnl_box = (TnlBox *)malloc((size_t)MAX_TNL_PARAMS * sizeof(TnlBox));
+     if (!s_tnl_vcpu || !s_tnl_pcpu || !s_tnl_box) return 0;
++#ifdef SR_GE_NATIVE
++    s_tnl_vhome = s_tnl_vcpu; s_tnl_rhome = s_tnl_rcpu; s_tnl_ihome = s_tnl_icpu; s_tnl_phome = s_tnl_pcpu;
++#endif
+     for (int i = 0; i < SUBMIT_FRAMES; i++) {
+         SubmitSlot *slot = &s_submit[i];
+-        if (!make_buffer((VkDeviceSize)TNL_ARENA_VERTS * sizeof(GeTnlVtx),
++        if (!make_buffer((VkDeviceSize)TNL_ARENA_VERTS * sizeof(TnlCorner),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &slot->tbuf, &slot->tbuf_mem,
+                          (void **)&slot->tmap)) return 0;
++        if (!make_buffer((VkDeviceSize)TNL_RAW_ARENA, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &slot->rbuf, &slot->rbuf_mem,
++                         (void **)&slot->rmap)) return 0;
++        if (!make_buffer((VkDeviceSize)TNL_ARENA_VERTS * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &slot->ibuf,
++                         &slot->ibuf_mem, (void **)&slot->imap)) return 0;
+         if (!make_buffer((VkDeviceSize)TNL_ARENA_PARAMS * sizeof(GeTnlParams),
+-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &slot->pbuf, &slot->pbuf_mem,
++                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &slot->pbuf, &slot->pbuf_mem,
+                          (void **)&slot->pmap)) return 0;
+         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+         dai.descriptorPool = s_tnl_dpool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_tnl_dlayout;
+         if (vkAllocateDescriptorSets(s_dev, &dai, &slot->tset) != VK_SUCCESS) return 0;
+-        VkDescriptorBufferInfo bi = { slot->pbuf, 0, VK_WHOLE_SIZE };
+-        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+-        w.dstSet = slot->tset; w.dstBinding = 0; w.descriptorCount = 1;
+-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
+-        vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
++        VkDescriptorBufferInfo bi[2] = { { slot->pbuf, 0, sizeof(GeTnlParams) }, { slot->rbuf, 0, VK_WHOLE_SIZE } };
++        VkWriteDescriptorSet w[2] = { { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
++        for (int k = 0; k < 2; k++) {
++            w[k].dstSet = slot->tset; w[k].dstBinding = (uint32_t)k; w[k].descriptorCount = 1;
++            w[k].descriptorType = k ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
++            w[k].pBufferInfo = &bi[k];
++        }
++        vkUpdateDescriptorSets(s_dev, 2, w, 0, NULL);
+     }
+     s_tnl_ready = 1;
+     return 1;
+ }
+ 
++#ifdef SR_GE_NATIVE
++int ge_split_on(void);
++/* the T&L ring, made at init once the GE runs in two stages */
++static int ring_init(void) {
++    if (!make_buffer((VkDeviceSize)RING_IDX_BYTES + RING_DATA_BYTES,
++                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &s_ring_buf, &s_ring_mem, (void **)&s_ring_map)) {
++        fprintf(stderr, "gegpu: the T&L ring (%u MB) could not be made: stopping\n", (RING_IDX_BYTES + RING_DATA_BYTES) >> 20);
++        return 0;
++    }
++    VkPhysicalDeviceProperties props;
++    vkGetPhysicalDeviceProperties(s_pdev, &props);
++    s_ring_ubo_align = (uint32_t)props.limits.minUniformBufferOffsetAlignment;
++    if (s_ring_ubo_align < 16u) s_ring_ubo_align = 16u;
++    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 } };
++    VkDescriptorPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
++    pc.maxSets = 1; pc.poolSizeCount = 2; pc.pPoolSizes = ps;
++    VKC(vkCreateDescriptorPool(s_dev, &pc, NULL, &s_ring_dpool));
++    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++    dai.descriptorPool = s_ring_dpool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_tnl_dlayout;
++    VKC(vkAllocateDescriptorSets(s_dev, &dai, &s_ring_set));
++    VkDescriptorBufferInfo bi[2] = { { s_ring_buf, 0, sizeof(GeTnlParams) }, { s_ring_buf, 0, VK_WHOLE_SIZE } };
++    VkWriteDescriptorSet w[2] = { { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
++    for (int k = 0; k < 2; k++) {
++        w[k].dstSet = s_ring_set; w[k].dstBinding = (uint32_t)k; w[k].descriptorCount = 1;
++        w[k].descriptorType = k ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
++        w[k].pBufferInfo = &bi[k];
++    }
++    vkUpdateDescriptorSets(s_dev, 2, w, 0, NULL);
++    for (int i = 0; i < SUBMIT_FRAMES; i++) s_submit[i].ring_lo[0] = s_submit[i].ring_lo[1] = UINT64_MAX;
++    s_ring_on = 1;
++    fprintf(stderr, "gegpu: the T&L ring: %u MB of indices, %u MB of records and vertices, written by the display list's stage\n",
++            RING_IDX_BYTES >> 20, RING_DATA_BYTES >> 20);
++    return 1;
++}
++
++/* (ge.c's front) the ring: its mapping, the regions' sizes and the record alignment; 0 when there is none */
++int gegpu_ring_get(uint8_t **map, uint32_t *idx_bytes, uint32_t *data_bytes, uint32_t *ubo_align) {
++    if (!s_ring_on) return 0;
++    *map = s_ring_map;
++    *idx_bytes = RING_IDX_BYTES;
++    *data_bytes = RING_DATA_BYTES;
++    *ubo_align = s_ring_ubo_align;
++    return 1;
++}
++/* (ge.c's front) region g's oldest position a draw may still read: the front writes below that plus the region's size */
++uint64_t gegpu_ring_free(int g) { return atomic_load_explicit(&s_ring_free[g], memory_order_acquire); }
++
++/* the oldest ring position still read: by a draw not yet recorded, recorded but not submitted, or not yet done on the GPU (a fence
++ * polled only once the screen's submit thread has made that submission) */
++static void ring_publish(void) {
++    if (!s_ring_on) return;
++    const uint64_t made = brick_ge_submitted ? brick_ge_submitted() : 0u;
++    uint64_t f[2] = { s_ring_seen_end[0], s_ring_seen_end[1] };
++    for (int g = 0; g < 2; g++)
++        if (s_ring_pending_lo[g] < f[g]) f[g] = s_ring_pending_lo[g];
++    for (int i = 0; i < SUBMIT_FRAMES; i++) {
++        SubmitSlot *sl = &s_submit[i];
++        if (sl->ring_lo[0] == UINT64_MAX && sl->ring_lo[1] == UINT64_MAX) continue;
++        if (sl->in_flight && !sl->ring_done && brick_ge_submitted && sl->ring_seq <= made)
++            sl->ring_done = vkGetFenceStatus(s_dev, sl->fence) == VK_SUCCESS;
++        if (sl->in_flight ? sl->ring_done : sl != s_cmd_slot) continue;
++        for (int g = 0; g < 2; g++)
++            if (sl->ring_lo[g] < f[g]) f[g] = sl->ring_lo[g];
++    }
++    for (int g = 0; g < 2; g++) atomic_store_explicit(&s_ring_free[g], f[g], memory_order_release);
++}
++
++/* (ge.c's front, through the renderer's thread) the ring is full: everything recorded, submitted and waited for */
++void gegpu_ring_room(void) {
++    submit_pending();
++    cmd_drain(GEGPU_BOUNDARY_OTHER);
++    ring_publish();
++    static int said;
++    if (said++ < 5) fprintf(stderr, "gegpu: the T&L ring was full: the GPU waited for (said 5 times)\n");
++}
++
++/* the stage in the CPU arrays */
++static void stage_home(void) {
++    s_stage_slot = NULL;
++    s_stage_rbias = 0;
++    s_tnl_vcpu = s_tnl_vhome; s_tnl_rcpu = s_tnl_rhome; s_tnl_icpu = s_tnl_ihome; s_tnl_pcpu = s_tnl_phome;
++    s_cap_t = MAX_TNL_VERTS; s_cap_r = TNL_RAW_BYTES; s_cap_i = MAX_TNL_VERTS; s_cap_p = MAX_TNL_PARAMS;
++}
++static uint32_t stage_min(uint32_t a, uint32_t b) { return a < b ? a : b; }
++/* an empty stage opened at the current slot's cursors, with room for a PRIM of need_* (a fresh slot when not) */
++static void stage_open(uint32_t need_r, uint32_t need_t, uint32_t need_i) {
++    if (!s_async_submit || (!s_cmd_slot && !cmd_begin_fresh())) { stage_home(); return; }
++    SubmitSlot *sl = s_cmd_slot;
++    uint32_t rb = (sl->rused + 15u) & ~15u;
++    const uint32_t want_r = need_r + 64u > (1u << 20) ? need_r + 64u : (1u << 20);
++    const uint32_t want_t = need_t > 8192u ? need_t : 8192u, want_i = need_i > 16384u ? need_i : 16384u;
++    if (rb + want_r > TNL_RAW_ARENA || sl->tused + want_t > TNL_ARENA_VERTS || sl->iused + want_i > TNL_ARENA_VERTS ||
++        sl->pused + 64u > TNL_ARENA_PARAMS) {
++        if (!cmd_batch_flush() || !cmd_begin_fresh()) { stage_home(); return; }
++        sl = s_cmd_slot;
++        rb = 0;
++    }
++    s_stage_slot = sl;
++    s_sb_r = rb; s_sb_t = sl->tused; s_sb_i = sl->iused; s_sb_p = sl->pused;
++    s_stage_rbias = rb;
++    s_tnl_rcpu = sl->rmap + rb; s_tnl_vcpu = sl->tmap + s_sb_t; s_tnl_icpu = sl->imap + s_sb_i; s_tnl_pcpu = sl->pmap + s_sb_p;
++    s_cap_r = stage_min(TNL_RAW_BYTES, TNL_RAW_ARENA - rb - 16u);
++    s_cap_t = stage_min(MAX_TNL_VERTS, TNL_ARENA_VERTS - s_sb_t);
++    s_cap_i = stage_min(MAX_TNL_VERTS, TNL_ARENA_VERTS - s_sb_i);
++    s_cap_p = stage_min(MAX_TNL_PARAMS, TNL_ARENA_PARAMS - s_sb_p);
++}
++#endif
++
+ /* ge.c proved the PRIM's triangles reach the rasterizer from psp_tnl.vert with the bits its
+  * own T&L and hook_tri would give them; the fragment state and batching are hook_tri's. */
+ static int hook_tnl_prim(const GeTnlPrim *p) {
+@@ -5698,17 +6486,116 @@ static int hook_tnl_prim(const GeTnlPrim *p) {
+     /* Without a target, decline: ge.c's own T&L then reaches hook_tri, which decides the
+      * draw exactly as it does when GPU T&L is off. */
+     if (!begin_target()) return cpu_profile_hook_leave(0);
+-    if (s_ntnl + nv > MAX_TNL_VERTS || s_ntnlp >= MAX_TNL_PARAMS || s_nbatch >= MAX_BATCH - 1)
++#ifdef SR_GE_NATIVE
++    if (p->ring) {   /* everything the GPU reads is in the ring already: the draw */
++        /* the boxes stay in index order within one submission (tnl_rect): the index region wrapped, the batches so far go */
++        if ((s_ntnlb && p->ring_first < s_tnl_box[s_ntnlb - 1].first) || s_ntnlb >= MAX_TNL_PARAMS || s_nbatch >= MAX_BATCH - 1)
++            submit_pending();
++        for (int g = 0; g < 2; g++) {
++            if (p->ring_lo[g] < s_ring_pending_lo[g]) s_ring_pending_lo[g] = p->ring_lo[g];
++            if (p->ring_end[g] > s_ring_seen_end[g]) s_ring_seen_end[g] = p->ring_end[g];
++        }
++        s_tnl_box[s_ntnlb++] = (TnlBox){ p->ring_first, p->ring_first + nv, p->box[0], p->box[1], p->box[2], p->box[3], 0, 0, 0, 0, 0 };
++        b.tparam = RING_TP | p->ring_param;
++        append(&b, p->ring_first, nv);
++        s_cnt_tnl_prims++;
++        s_cnt_tnl_tris += p->ntri;
++        return cpu_profile_hook_leave(1);
++    }
++    if (s_ring_on) {
++        static int said;
++        if (!said++) fprintf(stderr, "gegpu: a T&L PRIM outside the ring while the ring is in use: not drawn, said once\n");
++        return cpu_profile_hook_leave(1);
++    }
++#endif
++    if (!p->raw || (!p->vtx_off && !p->vtx_stride) || p->raw_bytes > TNL_RAW_BYTES - 4u || p->nrefs > MAX_TNL_VERTS)
++        return cpu_profile_hook_leave(0);
++#ifdef SR_GE_NATIVE
++    /* the stage where the GPU reads it: opened when empty, sized by the slot's room */
++    if (!s_ntnl && !s_ntnli && !s_ntnlp && !s_nraw) stage_open(p->raw_bytes, p->nrefs, nv);
++    if (s_ntnl + p->nrefs > s_cap_t || s_ntnli + nv > s_cap_i || s_ntnlp >= s_cap_p ||
++        s_ntnlb >= MAX_TNL_PARAMS || s_nbatch >= MAX_BATCH - 1 || ((s_nraw + 3u) & ~3u) + p->raw_bytes > s_cap_r) {
++        submit_pending();
++        if (!s_ntnl && !s_ntnli && !s_ntnlp && !s_nraw) stage_open(p->raw_bytes, p->nrefs, nv);
++    }
++#else
++    if (s_ntnl + p->nrefs > MAX_TNL_VERTS || s_ntnli + nv > MAX_TNL_VERTS || s_ntnlp >= MAX_TNL_PARAMS ||
++        s_ntnlb >= MAX_TNL_PARAMS || s_nbatch >= MAX_BATCH - 1 || ((s_nraw + 3u) & ~3u) + p->raw_bytes > TNL_RAW_BYTES)
+         submit_pending();
+-    const uint32_t pi = s_ntnlp++;
+-    s_tnl_pcpu[pi] = *p->params;
+-    const uint32_t first = s_ntnl;
+-    for (uint32_t k = 0; k < nv; k++) {
+-        GeTnlVtx *o = &s_tnl_vcpu[s_ntnl++];
+-        *o = p->refs[p->tri[k]];
+-        o->param = pi;
+-    }
+-    s_tnl_box[pi] = (TnlBox){ first, s_ntnl, p->box[0], p->box[1], p->box[2], p->box[3] };
++#endif
++    /* the previous PRIM's record when the T&L state is the same (an object's PRIMs): one 1 KB
++     * record per object to stage and upload, not one per PRIM */
++    uint32_t pi;
++    static uint32_t s_last_params_id;   /* ge.c's id for the record staged last */
++    if (s_ntnlp > 0 && p->params_id != 0u && p->params_id == s_last_params_id) {
++        pi = s_ntnlp - 1;
++#ifdef SR_GE_NATIVE
++    } else {   /* ge.c gives a record a new id only when it differs: nothing to compare */
++        pi = s_ntnlp++;
++        s_tnl_pcpu[pi] = *p->params;
++        s_last_params_id = p->params_id;
++    }
++#else
++    } else if (s_ntnlp > 0 && memcmp(&s_tnl_pcpu[s_ntnlp - 1], p->params, sizeof(GeTnlParams)) == 0) {
++        pi = s_ntnlp - 1;
++        s_last_params_id = p->params_id;
++    } else {
++        pi = s_ntnlp++;
++        s_tnl_pcpu[pi] = *p->params;
++        s_last_params_id = p->params_id;
++    }
++#endif
++    /* the PRIM's raw vertex bytes staged once, its corners as offsets into them.
++     * Bytes inside a range staged since the last submit (the last four: an object's PRIMs index
++     * one vertex buffer) are not staged again: the PRIM's offsets point into that range. */
++    uint32_t rawbase = UINT32_MAX;
++    for (int k = 0; k < 4; k++) {
++        const uint8_t *lr = s_raw_recent[k].raw;
++        if (lr && p->raw >= lr && p->raw + p->raw_bytes <= lr + s_raw_recent[k].bytes) {
++            rawbase = s_raw_recent[k].base + (uint32_t)(p->raw - lr);
++            break;
++        }
++    }
++    if (rawbase == UINT32_MAX) {
++        rawbase = (s_nraw + 3u) & ~3u;
++        memcpy(s_tnl_rcpu + rawbase, p->raw, p->raw_bytes);
++        s_nraw = rawbase + p->raw_bytes;
++        s_raw_recent[s_raw_next] = (RawRecent){ p->raw, p->raw_bytes, rawbase };
++        s_raw_next = (s_raw_next + 1) & 3;
++    }
++    /* its vertices once each (offset, record), its triangles as indices into them: the GPU transforms a shared
++     * vertex once */
++    const uint32_t vfirst = s_ntnl;
++    {   /* through local pointers: no global cursor stored at every element */
++        TnlCorner *const o = s_tnl_vcpu + vfirst;
++        const uint32_t *const vo = p->vtx_off;
++#ifdef SR_GE_NATIVE
++        const uint32_t rb = s_stage_rbias + rawbase;   /* an offset in the slot's raw buffer */
++#else
++        const uint32_t rb = rawbase;
++#endif
++        if (vo) {
++            for (uint32_t u = 0; u < p->nrefs; u++) { o[u].off = rb + vo[u]; o[u].param = pi; }
++        } else {   /* by the stride */
++            const uint32_t st = p->vtx_stride;
++            for (uint32_t u = 0; u < p->nrefs; u++) { o[u].off = rb + u * st; o[u].param = pi; }
++        }
++        s_ntnl = vfirst + p->nrefs;
++    }
++    const uint32_t first = s_ntnli;
++    {
++        uint32_t *const io = s_tnl_icpu + first;
++        if (p->tri16) {
++            const uint16_t *const t16 = p->tri16;
++            for (uint32_t k = 0; k < nv; k++) io[k] = vfirst + t16[k];
++        } else {
++            const uint32_t *const tri = p->tri;
++            for (uint32_t k = 0; k < nv; k++) io[k] = vfirst + tri[k];
++        }
++        s_ntnli = first + nv;
++    }
++    s_tnl_box[s_ntnlb++] = (TnlBox){ first, s_ntnli, p->box[0], p->box[1], p->box[2], p->box[3], pi, rawbase, s_nraw, vfirst, s_ntnl };
++    b.tparam = pi;   /* the draw's record */
+     append(&b, first, nv);
+     s_cnt_tnl_prims++;
+     s_cnt_tnl_tris += p->ntri;
+@@ -5746,6 +6633,24 @@ static int hook_sprite(const GeVtx *p0, const GeVtx *p1, int persp) {
+     float xa = floorf(fminf(p0->x, p1->x)), xb = floorf(fmaxf(p0->x, p1->x));
+     float ya = floorf(fminf(p0->y, p1->y)), yb = floorf(fmaxf(p0->y, p1->y));
+     if (xb <= xa || yb <= ya) return cpu_profile_hook_leave(1);
++    /* the module's say over a sprite (sdk_sprite_draw, weak: a module defines it): dropped (a HUD
++     * hidden by a setting) or moved down by dy pixels (a HUD laid out for another screen shape) */
++    GeVtx q0, q1;
++    float mod_dy = 0.0f;   /* the module's move, and whether it keeps Vert+'s rows for the sprite */
++    int mod_extend = 0;
++    if (sdk_sprite_draw && !s_ge->clear) {   /* a clear is no layout's: never moved (a menu's clear strips over the
++                                               * whole height, moved with its screen, left the rows below uncleared) */
++        SdkSpriteDraw d = { s_ge->tex_addr, s_ge->tex_enable, (int)((s_ge->vtype >> 23) & 1u), xa, ya, xb, yb, 0.0f, 0,
++                            fminf(p0->u, p1->u), fminf(p0->v, p1->v), fmaxf(p0->u, p1->u), fmaxf(p0->v, p1->v), s_ge->tex_w, s_ge->tex_h, 0, 0 };
++        sdk_sprite_draw(&d);
++        if (d.skip) return cpu_profile_hook_leave(1);
++        mod_dy = d.dy;
++        mod_extend = d.extend;
++        if (d.dy != 0.0f) {
++            q0 = *p0; q1 = *p1; q0.y += d.dy; q1.y += d.dy; p0 = &q0; p1 = &q1;
++            ya += d.dy; yb += d.dy;
++        }
++    }
+ 
+     float u0 = p0->u, v0 = p0->v, u1 = p1->u, v1 = p1->v;
+     if (persp) {
+@@ -5772,6 +6677,17 @@ static int hook_sprite(const GeVtx *p0, const GeVtx *p1, int persp) {
+             if (xs1) xs_onetoone_plain(&b);
+         }
+     }
++    /* a fill: untextured, a clear, or a texture that shows no picture (one texel, or a tiny one blown up 8 times or
++     * more both ways: a fade's) */
++    const int fill = !s_ge->tex_enable || s_ge->clear ||
++                     (((s_ge->vtype >> 23) & 1u) && fabsf(u1 - u0) * 8.0f <= xb - xa && fabsf(v1 - v0) * 8.0f <= yb - ya);
++    if (s_vpad && fill && ya <= 0.0f && yb >= (float)FB_H) {
++        ya -= (float)s_vpad; yb += (float)s_vpad;   /* a clear or a fade (whole strips of it too): no picture to stretch */
++    } else if (s_vpad && mod_dy == 0.0f && !mod_extend && b.sy < 0 && ((s_ge->vtype >> 23) & 1u)) {
++        /* any other 2D sprite the module leaves in place keeps the PSP's rows: what a title parks off its screen, or a
++         * texture's rows past a picture's, stay unseen */
++        b.sy = 0; b.sh = FB_H;
++    }
+     float ua = ul, ub = ur, va = vt, vb = vbm;
+     if (s_scale > 1 && s_ge->tex_enable && !(s_ge->tex_filter & 0x100u)) {   /* nearest mag */
+         sprite_nearest_axis(&ua, &ub, xb - xa);
+@@ -5901,6 +6817,9 @@ static void hook_vram_dirty(uint32_t addr, uint32_t bytes) {
+             if (e->content_valid) {
+                 s_cnt_tex_invalidations++;
+                 e->content_valid = 0;
++#ifdef SR_GE_NATIVE
++                s_tex_inval_gen++;
++#endif
+             }
+             /* The cached state template carries this texture's descriptor, and a draw
+              * with unchanged GE registers takes the template fast path in state_get
+@@ -5942,7 +6861,26 @@ static void hook_vram_dirty(uint32_t addr, uint32_t bytes) {
+ }
+ 
+ static int hook_vram_read(uint32_t addr, uint32_t bytes) {
++#ifdef SR_GE_NATIVE
++    /* what the GPU drew stays on the GPU: a CPU read of VRAM reads guest memory as it is */
++    (void)addr; (void)bytes;
++    return 1;
++#endif
+     if (!s_ready || !bytes) return 1;
++    {
++        /* (dev, DSP_VRAMREAD_LOG=1) the guest's VRAM reads by 64 KiB block, every 200,000 */
++        static int vrlog = -1;
++        static unsigned long blocks[32], vrn;
++        if (vrlog < 0) vrlog = getenv("DSP_VRAMREAD_LOG") != NULL;
++        if (vrlog) {
++            blocks[((SR_PHYS(addr) - 0x04000000u) >> 16) & 31u]++;
++            if (++vrn % 200000u == 0u) {
++                fprintf(stderr, "VRAMREAD %lu:", vrn);
++                for (int i = 0; i < 32; i++) if (blocks[i]) fprintf(stderr, " 0x%05x:%lu", i << 16, blocks[i]);
++                fprintf(stderr, " (last 0x%08x x%u)\n", addr, bytes);
++            }
++        }
++    }
+     uint64_t read0 = SR_PHYS(addr);
+     uint64_t read1 = read0 + bytes;
+     /* Offsets from the start of VRAM; a read below it wraps to where no target lies. */
+@@ -5972,6 +6910,12 @@ static int hook_vram_read(uint32_t addr, uint32_t bytes) {
+ }
+ 
+ static int hook_vram_write_prepare(uint32_t addr, uint32_t bytes) {
++#ifdef SR_GE_NATIVE
++    /* a CPU store into VRAM flushes nothing and syncs no depth: the GPU's surfaces are its own;
++     * hook_vram_dirty (the commit) still drops the textures and re-uploads a CPU-written target */
++    (void)addr; (void)bytes;
++    return 1;
++#endif
+     if (!s_ready || !is_vram(addr)) return 1;
+     if (s_nbatch && !submit_pending()) return 0;
+     for (int i = 0; i < MAX_DEP; i++) {
+@@ -5983,6 +6927,9 @@ static int hook_vram_write_prepare(uint32_t addr, uint32_t bytes) {
+ }
+ 
+ static int hook_vram_pending(void) {
++#ifdef SR_GE_NATIVE
++    return 0;   /* nothing is ever owed to guest VRAM */
++#endif
+     if (s_nbatch) return 1;
+     for (int i = 0; i < MAX_TGT; i++) {
+         const Target *t = &s_tgts[i];
+@@ -6033,9 +6980,13 @@ static int hook_xfer(uint32_t startdata) {
+     ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     ic.srcSubresource.layerCount = 1;
+     ic.dstSubresource = ic.srcSubresource;
+-    ic.srcOffset.x = (int32_t)(sx * (uint32_t)s_scale); ic.srcOffset.y = (int32_t)(sy * (uint32_t)s_scale);
+-    ic.dstOffset.x = (int32_t)(dx * (uint32_t)s_scale); ic.dstOffset.y = (int32_t)(dy * (uint32_t)s_scale);
++    ic.srcOffset.x = (int32_t)(sx * (uint32_t)s_scale); ic.srcOffset.y = (int32_t)((sy + (uint32_t)s_vpad) * (uint32_t)s_scale);
++    ic.dstOffset.x = (int32_t)(dx * (uint32_t)s_scale); ic.dstOffset.y = (int32_t)((dy + (uint32_t)s_vpad) * (uint32_t)s_scale);
+     ic.extent.width = w * (uint32_t)s_scale; ic.extent.height = h * (uint32_t)s_scale; ic.extent.depth = 1;
++    if (s_vpad && sy == 0u && dy == 0u && h == FB_H) {   /* a whole screen: its rows above and below too */
++        ic.srcOffset.y = ic.dstOffset.y = 0;
++        ic.extent.height = SCL_H;
++    }
+     vkCmdCopyImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+     to_layout(s_cmd, dst->img, VK_IMAGE_ASPECT_COLOR_BIT, &dst->layout,
+@@ -6099,6 +7050,9 @@ int gegpu_replay_reset(void) {
+     }
+     for (int i = 0; i < MAX_DEP; i++) s_deps[i].cpu_dirty = 1;
+     for (int i = 0; i < s_tex_n; i++) s_tex[i].content_valid = 0;
++#ifdef SR_GE_NATIVE
++    s_tex_inval_gen++;
++#endif
+     s_cur = NULL;
+     s_snap_src = NULL;
+     s_snap_srcgen = 0;
+@@ -6139,6 +7093,26 @@ static void gpu_replay_snapshot(uint64_t out[SR_PERF_GPU_REPLAY_COUNT]) {
+         out[SR_PERF_GPU_FALLBACK_STENCIL + i] = s.fallback_readbacks[i];
+ }
+ 
++/* (dev) SR_GPU_CPU_PROFILE=1 with DSP_HLETIME=1: the renderer's phases since the last call, in ms (ge_worker.c, once a
++ * second) */
++void gegpu_dev_phase_line(void) {
++    static const char *names[GEGPU_CPU_PHASE_COUNT] = {
++        "state_prep", "state_key", "pipe_lookup", "pipe_create", "desc_alloc", "desc_update", "bind_record", "object_lookup",
++        "tex_decode", "tex_shadow", "vertex_prep", "snap_target", "snap_decision", "snap_region", "snap_meta", "command_record",
++        "memcpy", "heap" };
++    static GeGpuCpuProfileStats last;
++    if (!s_cpu_profile) return;
++    char line[1024];
++    int n = snprintf(line, sizeof line, "ge renderer phases (ms):");
++    for (int i = 0; i < GEGPU_CPU_PHASE_COUNT && n < (int)sizeof line - 40; i++) {
++        const uint64_t ns = s_cpu_profile_stats.phase[i].ns - last.phase[i].ns;
++        const uint64_t calls = s_cpu_profile_stats.phase[i].calls - last.phase[i].calls;
++        if (ns >= 100000u) n += snprintf(line + n, sizeof line - (size_t)n, " %s %.1f/%llu", names[i], (double)ns * 1e-6, (unsigned long long)calls);
++    }
++    last = s_cpu_profile_stats;
++    fprintf(stderr, "%s\n", line);
++}
++
+ void gegpu_cpu_profile_stats_get(GeGpuCpuProfileStats *out) {
+     if (out) *out = s_cpu_profile_stats;
+ }
+@@ -6380,7 +7354,7 @@ int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
+         ace_hud_present((int)(t - s_tgts), shown, t->dep ? t->dep->img : VK_NULL_HANDLE,
+                         t->dep ? t->dep->layout : VK_IMAGE_LAYOUT_UNDEFINED, (int)SCL_W, (int)SCL_H,
+                         t->dep ? t->dep->hud_zgen : 0u);
+-    int show_w = DRAW_W * present_scale(t), show_h = FB_H * present_scale(t);
++    int show_w = DRAW_W * present_scale(t), show_h = (int)FB_HT * present_scale(t);
+     VkImage wide = wide_compose(t, fbaddr, &show_w, &show_h);
+     int pr = sdl3vk_present_image_ex((void *)(wide ? wide : shown), show_w, show_h);
+     /* The frame was shown: its next draw begins a new frame, which clears its canvas first.
+@@ -6531,6 +7505,9 @@ void gegpu_ace_stats(GeGpuAceStats *out) {
+ /* Make the run's twin resources (s_twin). Called by gegpu_init before any target exists; a
+  * failure leaves the twin off. `color`: the twin's pass skips dither and the 16-bit colour snap. */
+ static int twin_init(int color) {
++    /* the twin's pass read its own snapshot through set 2, which is the target's input attachment now */
++    fprintf(stderr, "TWIN: not available in this build (patches/nakagawa/0005)\n");
++    if (1) return 0;
+     VkDescriptorPoolSize dpst = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                   TEX_FILTER_VARIANTS * (MAX_TGT + 1u) + 1u };
+     VkDescriptorPoolCreateInfo dpc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+@@ -6581,7 +7558,11 @@ int gegpu_init(void) {
+     s_pdev  = (VkPhysicalDevice)vi.physical;
+     s_dev   = (VkDevice)vi.device;
+     s_queue = (VkQueue)vi.queue;
++#ifdef SR_GE_NATIVE
++    s_ge    = ge_backend_state_ptr();   /* the state as of the operation running: ge.c's copy for the renderer */
++#else
+     s_ge    = ge_state_ptr();
++#endif
+     s_zbuf  = ge_zbuf_ptr();
+     {
+         const char *lg = getenv("SR_GPU_LOG");
+@@ -6613,6 +7594,11 @@ int gegpu_init(void) {
+         }
+         s_scale = sr_parse_render_scale(getenv("SR_GPU_SCALE"),
+                                         getenv("SR_RESOLUTION_SCALE"), MAX_SCALE);
++        if (sdk_vplus_rows) {
++            const int v = sdk_vplus_rows();
++            s_vpad = v < 0 ? 0 : v > 128 ? 128 : v;
++            if (s_vpad) fprintf(stderr, "gegpu: Vert+: %d rows above and below the PSP's 272 (%d x %u shown)\n", s_vpad, DRAW_W, FB_HT);
++        }
+         if (s_scale > 1)
+             fprintf(stderr, "gegpu: render scale %dx (%ux%u internal)\n", s_scale, SCL_W, SCL_H);
+     }
+@@ -6654,6 +7640,14 @@ int gegpu_init(void) {
+         }
+     }
+     s_xfer_align = props.limits.optimalBufferCopyOffsetAlignment;
++    /* psp_tnl.vert's record at a dynamic offset of a whole number of records */
++    if (sizeof(GeTnlParams) % props.limits.minUniformBufferOffsetAlignment != 0u ||
++        sizeof(GeTnlParams) > props.limits.maxUniformBufferRange) {
++        fprintf(stderr, "gegpu: GPU T&L's record (%u bytes) can't be a uniform buffer at a dynamic offset here (alignment %llu, range %u)\n",
++                (unsigned)sizeof(GeTnlParams), (unsigned long long)props.limits.minUniformBufferOffsetAlignment,
++                props.limits.maxUniformBufferRange);
++        return 0;
++    }
+     if (s_xfer_align < 4) s_xfer_align = 4;
+ 
+     VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+@@ -6688,15 +7682,31 @@ int gegpu_init(void) {
+     at[1].format = VK_FORMAT_D16_UNORM;
+     at[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+     at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+-    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++    /* the colour attachment is also the subpass's input attachment (u_dst), so both in GENERAL, and a by-region
++     * self-dependency for the barriers between draws (record_range) */
++    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_GENERAL };
++    VkAttachmentReference iref = { 0, VK_IMAGE_LAYOUT_GENERAL };
+     VkAttachmentReference zref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+     VkSubpassDescription sub = {0};
+     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+     sub.colorAttachmentCount = 1; sub.pColorAttachments = &cref;
++    sub.inputAttachmentCount = 1; sub.pInputAttachments = &iref;
+     sub.pDepthStencilAttachment = &zref;
++    /* where the device reads attachments in raster order (VK_EXT_rasterization_order_attachment_
++     * access, the GE8300 has it), the subpass and every pipeline say so and no barrier stands between draws: on a tiler a barrier
++     * in a render pass is a partial render (every tile stored and loaded) */
++    if (raster_order_on()) sub.flags |= VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
++    VkSubpassDependency self = {0};
++    self.srcSubpass = 0; self.dstSubpass = 0;
++    self.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++    self.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++    self.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    self.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
++    self.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+     VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+     rpc.attachmentCount = 2; rpc.pAttachments = at;
+     rpc.subpassCount = 1; rpc.pSubpasses = &sub;
++    rpc.dependencyCount = 1; rpc.pDependencies = &self;
+     VKC(vkCreateRenderPass(s_dev, &rpc, NULL, &s_rp));
+ 
+     /* the transfer staging buffer must hold one full SCALED color image */
+@@ -6721,6 +7731,7 @@ int gegpu_init(void) {
+     VkDescriptorSetLayoutCreateInfo dlc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+     dlc.bindingCount = 1; dlc.pBindings = &db;
+     VKC(vkCreateDescriptorSetLayout(s_dev, &dlc, NULL, &s_dlayout));
++    db.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;   /* the target itself */
+     VKC(vkCreateDescriptorSetLayout(s_dev, &dlc, NULL, &s_dst_dlayout));
+ 
+ 
+@@ -6749,18 +7760,30 @@ int gegpu_init(void) {
+     dpc.maxSets = FIXED_FILTER_DESCRIPTOR_SETS + 1u; dpc.pPoolSizes = &dpsf;
+     dpc.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+     VKC(vkCreateDescriptorPool(s_dev, &dpc, NULL, &s_dpool_fix));
++    {
++        /* the targets' and wing canvases' input-attachment sets */
++        VkDescriptorPoolSize dpi = { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 4u * (MAX_TGT + MAX_WING) };
++        VkDescriptorPoolCreateInfo dpic = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
++        dpic.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
++        dpic.maxSets = 4u * (MAX_TGT + MAX_WING); dpic.poolSizeCount = 1; dpic.pPoolSizes = &dpi;
++        VKC(vkCreateDescriptorPool(s_dev, &dpic, NULL, &s_dpool_in));
++    }
+ 
+     /* Set 1: the GPU T&L parameter arena (#318). Every pipeline shares the one layout; only
+      * psp_tnl.vert reads set 1, and only its draws bind it. */
+-    VkDescriptorSetLayoutBinding tdb = {0};
+-    tdb.binding = 0; tdb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-    tdb.descriptorCount = 1; tdb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++    VkDescriptorSetLayoutBinding tdb[2] = {{0}};   /* 0: parameter records, 1: raw vertex bytes */
++    for (int k = 0; k < 2; k++) {
++        tdb[k].binding = (uint32_t)k; tdb[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        tdb[k].descriptorCount = 1; tdb[k].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++    }
++    tdb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;   /* the draw's record */
+     VkDescriptorSetLayoutCreateInfo tdlc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+-    tdlc.bindingCount = 1; tdlc.pBindings = &tdb;
++    tdlc.bindingCount = 2; tdlc.pBindings = tdb;
+     VKC(vkCreateDescriptorSetLayout(s_dev, &tdlc, NULL, &s_tnl_dlayout));
+-    VkDescriptorPoolSize tdps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SUBMIT_FRAMES };
++    VkDescriptorPoolSize tdps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SUBMIT_FRAMES },
++                                     { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, SUBMIT_FRAMES } };
+     VkDescriptorPoolCreateInfo tdpc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+-    tdpc.maxSets = SUBMIT_FRAMES; tdpc.poolSizeCount = 1; tdpc.pPoolSizes = &tdps;
++    tdpc.maxSets = SUBMIT_FRAMES; tdpc.poolSizeCount = 2; tdpc.pPoolSizes = tdps;
+     VKC(vkCreateDescriptorPool(s_dev, &tdpc, NULL, &s_tnl_dpool));
+ 
+     VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushPC) };
+@@ -6780,6 +7803,9 @@ int gegpu_init(void) {
+      * shaderDenormPreserveFloat32. Without them there is no T&L stage: hook_tnl_prim declines
+      * and ge.c keeps T&L. */
+     s_vs_tnl = VK_NULL_HANDLE;
++#ifdef SR_GE_NATIVE
++    vi.denorm_preserve_f32 = 1;   /* psp_tnl.vert built without DenormPreserve: the transform is the GPU's, natively */
++#endif
+     if (vi.denorm_preserve_f32) {
+         smc.codeSize = sizeof(k_tnl_vert_spv); smc.pCode = k_tnl_vert_spv;
+         VKC(vkCreateShaderModule(s_dev, &smc, NULL, &s_vs_tnl));
+@@ -6819,8 +7845,7 @@ int gegpu_init(void) {
+         s_snap_set[i] = make_descriptor(s_snap_view, s_smp[i], s_dpool_fix);
+         if (!s_snap_set[i]) return 0;
+     }
+-    s_dst_set = make_dst_descriptor(s_snap_view, s_dpool_fix);
+-    if (!s_dst_set) return 0;
++    s_dst_set = VK_NULL_HANDLE;   /* set 2 is each target's own input attachment */
+     /* The host twin (32-bit colour, #2050), decided above. */
+     if (twin_req && !twin_init(twin_req == 1)) {
+         fprintf(stderr, "TWIN: unavailable (the GPU could not make it): native colour at render "
+@@ -6850,6 +7875,9 @@ int gegpu_init(void) {
+     s_readback_commit_failures = 0;
+     s_ready = 1;
+     ge_set_gpu_hooks(&k_hooks);
++#ifdef SR_GE_NATIVE
++    if (ge_split_on() && !ring_init()) return 0;   /* the front stage writes the T&L ring */
++#endif
+     fprintf(stderr, "gegpu: full GPU GE active (persistent targets, %s, no software fallback)\n",
+             s_async_submit ? "8-slot async render/snapshot batching" : "exact synchronous submits");
+     if (s_cpu_profile)
+@@ -6877,7 +7905,14 @@ void gegpu_shutdown(void) {
+     /* Presentation uses the same device but owns separate fences/semaphores. Shutdown is
+      * a real resource-lifetime boundary, so retire all device work before destroying any
+      * object that a recorded command or descriptor can reference. */
++#ifdef SR_GE_NATIVE
++    if (brick_submit_drain) brick_submit_drain();   /* nothing of ours still queued on the screen's thread */
++    if (brick_queue_lock) brick_queue_lock();
++    (void)vkDeviceWaitIdle(s_dev);
++    if (brick_queue_unlock) brick_queue_unlock();
++#else
+     (void)vkDeviceWaitIdle(s_dev);
++#endif
+     stats_emit(1);
+     pcache_close(1);   /* the device is idle: every pipeline this run made is in the cache */
+     if (s_ts_on) {
+@@ -6927,6 +7962,10 @@ void gegpu_shutdown(void) {
+         tex_xs_free(e);
+     }
+     s_tex_n = 0;
++#ifdef SR_GE_NATIVE
++    memset(s_tex_index, 0, sizeof(s_tex_index));
++    s_tex_snap_ok = 0;
++#endif
+     const int had_repl = s_repl != NULL;
+     tex_repl_shutdown();   /* the exit line, the pack closed; the scaled-copy machinery it used goes next */
+     if (had_repl && !s_xs_factor && !s_xs_smart2d) nk_tex_scale_shutdown();
+@@ -6944,6 +7983,7 @@ void gegpu_shutdown(void) {
+     for (int i = 0; i < s_pipe_n; i++)
+         if (s_pipes[i].pipe) vkDestroyPipeline(s_dev, s_pipes[i].pipe, NULL);
+     s_pipe_n = 0;
++    memset(s_pipe_index, 0, sizeof(s_pipe_index));
+     free(s_pipes);
+     s_pipes = NULL;
+     s_pipe_cap = 0;
+@@ -6985,6 +8025,12 @@ void gegpu_shutdown(void) {
+         if (slot->tmap) vkUnmapMemory(s_dev, slot->tbuf_mem);
+         if (slot->tbuf) vkDestroyBuffer(s_dev, slot->tbuf, NULL);
+         if (slot->tbuf_mem) vkFreeMemory(s_dev, slot->tbuf_mem, NULL);
++        if (slot->rmap) vkUnmapMemory(s_dev, slot->rbuf_mem);
++        if (slot->rbuf) vkDestroyBuffer(s_dev, slot->rbuf, NULL);
++        if (slot->rbuf_mem) vkFreeMemory(s_dev, slot->rbuf_mem, NULL);
++        if (slot->imap) vkUnmapMemory(s_dev, slot->ibuf_mem);
++        if (slot->ibuf) vkDestroyBuffer(s_dev, slot->ibuf, NULL);
++        if (slot->ibuf_mem) vkFreeMemory(s_dev, slot->ibuf_mem, NULL);
+         if (slot->pmap) vkUnmapMemory(s_dev, slot->pbuf_mem);
+         if (slot->pbuf) vkDestroyBuffer(s_dev, slot->pbuf, NULL);
+         if (slot->pbuf_mem) vkFreeMemory(s_dev, slot->pbuf_mem, NULL);
+@@ -7006,9 +8052,13 @@ void gegpu_shutdown(void) {
+     if (s_tnl_dpool) vkDestroyDescriptorPool(s_dev, s_tnl_dpool, NULL);
+     if (s_tnl_dlayout) vkDestroyDescriptorSetLayout(s_dev, s_tnl_dlayout, NULL);
+     s_vs_tnl = VK_NULL_HANDLE; s_tnl_dpool = VK_NULL_HANDLE; s_tnl_dlayout = VK_NULL_HANDLE;
+-    free(s_tnl_vcpu); free(s_tnl_pcpu); free(s_tnl_box);
++#ifdef SR_GE_NATIVE
++    stage_home();   /* the stage may be in a slot's mapped memory: the CPU arrays are the ones to free */
++#endif
++    free(s_tnl_vcpu); free(s_tnl_pcpu); free(s_tnl_box); free(s_tnl_rcpu); s_tnl_rcpu = NULL; free(s_tnl_icpu); s_tnl_icpu = NULL;
+     s_tnl_vcpu = NULL; s_tnl_pcpu = NULL; s_tnl_box = NULL;
+-    s_tnl_ready = 0; s_ntnl = s_ntnlp = 0;
++    s_tnl_ready = 0; s_ntnl = s_ntnlp = s_ntnlb = 0; s_nraw = 0; s_ntnli = 0;
++    memset(s_raw_recent, 0, sizeof(s_raw_recent));
+     if (s_playout) vkDestroyPipelineLayout(s_dev, s_playout, NULL);
+     if (s_rp) vkDestroyRenderPass(s_dev, s_rp, NULL);
+     if (s_dlayout) vkDestroyDescriptorSetLayout(s_dev, s_dlayout, NULL);

@@ -1,0 +1,27 @@
+diff --git a/src/rt/osk_text_entry.c b/src/rt/osk_text_entry.c
+index ee81fab2..7912aca0 100644
+--- a/src/rt/osk_text_entry.c
++++ b/src/rt/osk_text_entry.c
+@@ -191,8 +191,22 @@ static int osk_text_entry_poll_live(const wchar_t *desc, const wchar_t *initial,
+     if (!out || cap < 2) return 0;
+     if (osk_text_entry_unanswerable()) return SR_OSK_TEXT_PENDING;
+     if (sr_osk_overlay_host()) return sr_osk_overlay_poll(desc, initial, out, cap, input_type);
++#ifdef SR_GE_NATIVE
++    /* no keyboard can be shown here yet (the Brick's presenter draws no overlay): the field is
++     * answered with the game's own text, as a person pressing OK at once would, and said in the log (answered cancelled, a game's
++     * name entry may never end) */
++    (void)input_type;
++    int n = 0;
++    if (initial)
++        while (n < cap - 1 && initial[n]) { out[n] = initial[n]; n++; }
++    out[n] = 0;
++    fprintf(stderr, "osk: no on-screen keyboard on this screen yet: \"%ls\" answered with the game's own text \"%ls\"\n",
++            desc ? desc : L"", out);
++    return 1;
++#else
+     /* input_type is enforced only by the in-window keyboard; this native box fallback takes none. */
+     return sr_osk_input(desc, initial, out, cap) == 1;
++#endif
+ }
+ 
+ static void osk_text_entry_abandon_live(void) {

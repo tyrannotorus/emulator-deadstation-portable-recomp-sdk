@@ -1,0 +1,58 @@
+diff --git a/src/rt/sched.c b/src/rt/sched.c
+index 4c239c6f..a6e16af0 100644
+--- a/src/rt/sched.c
++++ b/src/rt/sched.c
+@@ -1891,6 +1891,31 @@ static int sched_dispatch_interrupt_guest(CpuState *cpu, uint32_t entry,
+     return 0;
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* a game function called from an HLE call, on the calling thread: entry(a0, a1, a2) on that thread's
++ * stack below its frame, its registers restored after (a library's handler a PSP calls from its own thread: ad hoc events). 0, or
++ * -1 when the call went fatal. */
++int sched_call_guest_from_hle(uint32_t entry, uint32_t a0, uint32_t a1, uint32_t a2) {
++    if (!s_cpu || !entry) return -1;
++    CpuState save;
++    memcpy(&save, s_cpu, sizeof(CpuState));
++    s_cpu->r[29] = (save.r[29] - 0x400u) & ~0xFu;
++    s_cpu->r[28] = s_gp;
++    s_cpu->r[4] = a0;
++    s_cpu->r[5] = a1;
++    s_cpu->r[6] = a2;
++    s_cpu->r[31] = SR_HOST_RETURN_PC;
++    s_cpu->pc = entry;
++    uint32_t fatal_target = 0u;
++    const int fatal = sched_dispatch_interrupt_guest(s_cpu, entry, "an HLE call's handler", &fatal_target);
++    if (fatal) {
++        fprintf(stderr, "sched: a handler called from an HLE call went fatal (entry 0x%08x, target 0x%08x)\n", entry, fatal_target);
++        return -1;
++    }
++    memcpy(s_cpu, &save, sizeof(CpuState));
++    return 0;
++}
++#endif
+ static int sched_env_switch(int *cached, const char *name);
+ 
+ /* Diagnostic switches read on every delivered VBLANK, once per process like the per-call
+@@ -3534,7 +3559,7 @@ void sr_yield(CpuState *s) {
+          * Important: wake==(uint64_t)-1 means "wait on object" (infinite), not a
+          * finite timed wait -- must skip it or the initial wait check below would
+          * set adv=(uint64_t)-1 and create an invalid deadline.
+-         */
++ */
+         /* Not under the deterministic clock (#2037): there guest time passes with the work, one
+          * slice per scheduler boundary, and a sleeper's deadline is reached by running, as on a
+          * PSP. This jump charges the running thread a whole wait for every slice it runs (the
+@@ -3576,6 +3601,12 @@ void sr_yield(CpuState *s) {
+         if (++spun % 100000ull == 2001) {
+             if (s_watchdog_spin_observations != UINT32_MAX)
+                 s_watchdog_spin_observations++;
++#ifdef SR_GE_NATIVE
++            /* the dump is dev only (SR_SPIN_DUMP=1): forty unbuffered lines a time stall the game */
++            static int spin_dump = -1;
++            if (spin_dump < 0) spin_dump = getenv("SR_SPIN_DUMP") != NULL;
++            if (!spin_dump) dumps = 6;
++#endif
+             if (dumps < 6) {
+                 dumps++;
+             static const char *stn[] = {"DORMANT", "READY", "RUNNING", "WAIT_DELAY", "WAIT_OBJ"};

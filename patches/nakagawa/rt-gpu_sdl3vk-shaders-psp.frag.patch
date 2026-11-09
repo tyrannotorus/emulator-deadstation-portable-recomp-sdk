@@ -1,0 +1,200 @@
+diff --git a/src/rt/gpu_sdl3vk/shaders/psp.frag b/src/rt/gpu_sdl3vk/shaders/psp.frag
+index a8181551..3883d6a6 100644
+--- a/src/rt/gpu_sdl3vk/shaders/psp.frag
++++ b/src/rt/gpu_sdl3vk/shaders/psp.frag
+@@ -17,19 +17,24 @@
+  * batch-build time -- overlapping primitives inside one batch read the pre-batch
+  * destination, the standard shader-blend hazard). Colors are computed in 0..255 space
+  * to track the integer formulas in shade()/blend_chan(). */
+-layout(location = 0) noperspective in vec2  v_uv;
+-layout(location = 1) noperspective in float v_rw;
++/* v_uv and v_rw interpolated with perspective: psp_tnl.vert hands the GPU true clip
++ * coordinates (u, v and rw = 1, the GPU clips and divides); psp.vert's vertices have w = 1, where the two are the same */
++layout(location = 0) in vec2  v_uv;
++layout(location = 1) in float v_rw;
+ layout(location = 2) noperspective in float v_fog;
+ layout(location = 3) noperspective in vec4  v_color;
+-layout(location = 4) flat in vec4 v_uvbox;   /* edge clamp range (ge_gpu.c uv_edge_axis) */
++layout(location = 4) flat in vec4 v_uvbox;
++layout(location = 5) flat in vec4 v_color_flat;   /* the first vertex's colour: the PSP's flat shading (F_FLAT) */   /* edge clamp range (ge_gpu.c uv_edge_axis) */
+ 
+ layout(location = 0) out vec4 o_color;
++/* the source alpha for a dual-source fixed-function blend (ge_gpu.c F_DUALSRC) */
++layout(location = 0, index = 1) out vec4 o_color1;
+ 
+ layout(set = 0, binding = 0) uniform sampler2D u_tex;
+ /* The destination snapshot (shader blend) has a set of its own, bound once per render op, so the
+  * host twin (ge_gpu.c, Enhanced 32-bit colour) binds its own snapshot without a second copy of
+  * every texture's set. */
+-layout(set = 2, binding = 0) uniform sampler2D u_dst;
++layout(input_attachment_index = 0, set = 2, binding = 0) uniform subpassInput u_dst;   /* the target itself */
+ 
+ /* flags bits (pc.cfg.x >> 8): 1 textured, 2 texfunc-RGBA, 4 color-double, 8 fog,
+  * 16 persp (apply minz/maxz), 32 clear mode, 64 nearest filter (both TEXFILTER fields),
+@@ -136,23 +141,33 @@ int quant_alpha(int a, int fbfmt) {
+     return a;
+ }
+ 
++/* false in a pipeline none of whose draws can drop a fragment: no discard compiled in */
++layout(constant_id = 0) const bool k_can_discard = true;
++/* cfg.x (texture function, flags) as the pipeline's constant: the branches on it fold away */
++layout(constant_id = 1) const int k_cfg = -1;
++
+ void main() {
+-    int flags = pc.cfg.x >> 8;
++    const int cfgx = k_cfg >= 0 ? k_cfg : pc.cfg.x;
++    int flags = cfgx >> 8;
+     int fbfmt = (flags >> 10) & 3;
+ 
+     /* Screen derivatives of the affine varyings, taken here in uniform control flow (before
+      * any discard). Per device pixel; times the render scale they are per PSP pixel. */
+     float lod_scale = float(max(pc.bl.y, 1));
+-    vec2 duv_dx = dFdxFine(v_uv) * lod_scale, duv_dy = dFdyFine(v_uv) * lod_scale;
+-    float drw_dx = dFdxFine(v_rw) * lod_scale, drw_dy = dFdyFine(v_rw) * lod_scale;
++    vec2 duv_dx = vec2(0.0), duv_dy = vec2(0.0);
++    float drw_dx = 0.0, drw_dy = 0.0;
++    if ((flags & 16384) != 0) {   /* only for the per-fragment level of detail; a uniform branch, before any discard */
++        duv_dx = dFdxFine(v_uv) * lod_scale; duv_dy = dFdyFine(v_uv) * lod_scale;
++        drw_dx = dFdxFine(v_rw) * lod_scale; drw_dy = dFdyFine(v_rw) * lod_scale;
++    }
+ 
+     /* PSP depth-range test: discard transform-mode pixels outside [minz,maxz]. */
+     if ((flags & 16) != 0) {
+         int z16 = int(gl_FragCoord.z * 65535.0 + 0.5);
+-        if (z16 < pc.cfg.z || z16 > pc.cfg.w) discard;
++        if (z16 < pc.cfg.z || z16 > pc.cfg.w) { if (k_can_discard) discard; }
+     }
+ 
+-    vec4 v = v_color * 255.0;
++    vec4 v = ((flags & 4194304) != 0 ? v_color_flat : v_color) * 255.0;
+     vec4 col = v;
+ 
+     if ((flags & 32) == 0) {
+@@ -180,7 +195,7 @@ void main() {
+              * outer half takes the edge pixel's own coordinate instead of reaching past it. */
+             if (v_uvbox.x <= v_uvbox.z) uv.x = clamp(uv.x, v_uvbox.x, v_uvbox.z);
+             if (v_uvbox.y <= v_uvbox.w) uv.y = clamp(uv.y, v_uvbox.y, v_uvbox.w);
+-            uv = floor(uv * 4096.0 + vec2(0.5)) / 4096.0;
++            /* the sampler's own nearest or linear: no 1/4096 rounding, no 1/16 weight steps */
+             /* Flags bits 17-19: the bound texture is a scaled copy of the guest's (texture
+              * scaling, an Ace run only), factor = bits + 1. Both rules then run on the copy's
+              * own texel lattice, so nearest keeps the copy's detail and linear steps in
+@@ -188,8 +203,7 @@ void main() {
+              * the bits clear, as for every guest texture and render target, nothing changes. */
+             int tscale = ((flags >> 17) & 7) + 1;
+             if (tscale > 1) uv *= float(tscale);
+-            if ((flags & 64) != 0) uv = floor(uv) + vec2(0.5);
+-            else uv = floor((uv - vec2(0.5)) * 16.0) / 16.0 + vec2(0.5);
++
+             if (tscale > 1) uv /= float(tscale);
+             uv += pc.texsize.zw;
+             vec4 t;
+@@ -205,7 +219,7 @@ void main() {
+                 int lcfg = (pc.cfg.y >> 24) & 0xFF, lmax = (lcfg >> 2) & 7;
+                 int detail16 = int(pc.fogcol.a);
+                 if ((lcfg & 1) != 0) {
+-                    detail16 += 16 + lod_log16(pc.texenv.a) - lod_log16(v_rw);
++                    detail16 += 16 + lod_log16(pc.texenv.a) - lod_log16(v_rw * gl_FragCoord.w);   /* q = 1/w: rw (psp.vert) or the GPU's own 1/w (psp_tnl.vert) */
+                 } else {
+                     vec2 u0 = v_uv / rw;
+                     vec2 dx = (duv_dx - u0 * drw_dx) / rw, dy = (duv_dy - u0 * drw_dy) / rw;
+@@ -230,7 +244,7 @@ void main() {
+             } else {
+                 t = texture(u_tex, uv / pc.texsize.xy) * 255.0;
+             }
+-            int  tf    = pc.cfg.x & 7;
++            int  tf    = cfgx & 7;
+             bool rgba  = (flags & 2) != 0;
+             float dscl = ((flags & 4) != 0) ? 2.0 : 1.0;
+             vec3 rgb; float al;
+@@ -268,7 +282,16 @@ void main() {
+             else if (afunc == 5) pass = (av <= aref);
+             else if (afunc == 6) pass = (av >  aref);
+             else                 pass = (av >= aref);
+-            if (!pass) discard;
++            if (!pass) { if (k_can_discard) discard; }
++        }
++
++        /* the PSP's colour test, on the colour before blending: (rgb & mask) against (ref & mask) */
++        if ((flags & 2097152) != 0) {
++            ivec3 c = ivec3(col.rgb + 0.5);
++            int cv = c.r | (c.g << 8) | (c.b << 16), m = pc.dith[2];
++            bool eq = (cv & m) == (pc.dith[1] & m);
++            int cf = pc.dith[0];
++            if (cf == 0 || (cf == 2 && !eq) || (cf == 3 && eq)) { if (k_can_discard) discard; }
+         }
+ 
+         if ((flags & 8) != 0) {
+@@ -290,11 +313,12 @@ void main() {
+      * as in ge.c stencil_test_pass(). A failing pixel keeps its colour and takes the
+      * stencil-fail op; a passing one carries the depth-pass op's value to the store.
+      * The depth-fail op is KEEP (ge_gpu.c), so the pipeline depth test discards. */
++    const float src_alpha = col.a;
+     bool stencil_fail = false;
+     int stencil = 0;
+     ivec4 spx = ivec4(0);
+     if ((flags & 8192) != 0) {
+-        spx = ivec4(texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
++        spx = ivec4(subpassLoad(u_dst) * 255.0 + 0.5);
+         if (fbfmt == 0) spx.a = 0;   /* a 565 pixel's stencil reads 0 (ge.c, PSP-GE-RASTER-001) */
+         int smask = (pc.bl.z >> 16) & 0xFF, sref = (pc.bl.z >> 8) & 0xFF;
+         int ref = sref & smask, val = spx.a & smask, sfunc = pc.bl.z & 7;
+@@ -308,7 +332,7 @@ void main() {
+         else if (sfunc == 6) pass = ref >  val;
+         else                 pass = ref >= val;
+         if (!pass) {
+-            if ((pc.bl.w & 7) == 0) discard;
++            if ((pc.bl.w & 7) == 0) { if (k_can_discard) discard; }
+             stencil_fail = true;
+             col = vec4(spx);
+             stencil = stencil_op(pc.bl.w & 7, spx.a, sref, fbfmt);
+@@ -321,7 +345,7 @@ void main() {
+      * integer math identical to ge.c blend_chan(). Runs BEFORE dither/quantization so
+      * the 16-bit lattice snap applies to the blend RESULT, like the hardware store. */
+     if ((flags & 4096) != 0 && !stencil_fail) {
+-        ivec4 dpx = ivec4(texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
++        ivec4 dpx = ivec4(subpassLoad(u_dst) * 255.0 + 0.5);
+         if (fbfmt == 0) dpx.a = 0;   /* blending reads a 565 pixel's alpha as 0 (ge.c read_fb_px) */
+         ivec3 s   = ivec3(col.rgb + 0.5);
+         int   sa  = int(col.a + 0.5);
+@@ -344,7 +368,7 @@ void main() {
+      * framebuffer pixel position (ge.c compose_px_rgba) — divide the device coordinate
+      * by the render scale so upscaled rendering keeps the native pattern. Applies in
+      * clear mode too, and post-blend when shader blending is active (hardware order). */
+-    if ((flags & 512) != 0 && !stencil_fail) {
++    if (false) {   /* no ordered dither: the targets hold 8 bits a channel */
+         ivec2 fc = ivec2(gl_FragCoord.xy) / max(pc.bl.y, 1);
+         int row = pc.dith[fc.y & 3];
+         int dv = (row >> ((fc.x & 3) * 8)) & 0xFF;
+@@ -357,18 +381,18 @@ void main() {
+      * replication — identical to ge.c pack_fb + unpack_color, so the RGBA8 image and
+      * guest VRAM stay bit-identical across arbitrarily many frames. The host twin's full
+      * colour (65536) keeps the colour and snaps only the alpha, which holds the stencil. */
+-    if ((flags & 65536) != 0) {
++    if ((flags & 1048576) != 0) {
++        /* a fixed-function blend: the colour unsnapped; the stored alpha is the constant stencil or masked off */
++    } else if ((flags & 65536) != 0) {
+         if (fbfmt == 0) col.a = 255.0;
+         else if (fbfmt == 1) col.a = col.a >= 128.0 ? 255.0 : 0.0;
+         else if (fbfmt == 2) col.a = quant_chan(col.a, 4);
+-    } else if (fbfmt == 0) {
+-        col = vec4(quant_chan(col.r, 5), quant_chan(col.g, 6), quant_chan(col.b, 5), 255.0);
++    } else if (fbfmt == 0) {   /* colour at 8 bits; the format's alpha as the PSP stores it */
++        col.a = 255.0;
+     } else if (fbfmt == 1) {
+-        col = vec4(quant_chan(col.r, 5), quant_chan(col.g, 5), quant_chan(col.b, 5),
+-                   col.a >= 128.0 ? 255.0 : 0.0);
++        col.a = col.a >= 128.0 ? 255.0 : 0.0;
+     } else if (fbfmt == 2) {
+-        col = vec4(quant_chan(col.r, 4), quant_chan(col.g, 4), quant_chan(col.b, 4),
+-                   quant_chan(col.a, 4));
++        col.a = quant_chan(col.a, 4);
+     }
+ 
+     /* The stored stencil is the op's value on the native lattice, under the alpha write
+@@ -384,4 +408,5 @@ void main() {
+     if ((flags & 32768) != 0) col.a = float(pc.bl.z & 0xFF);
+ 
+     o_color = col * (1.0 / 255.0);
++    o_color1 = vec4(src_alpha * (1.0 / 255.0));
+ }

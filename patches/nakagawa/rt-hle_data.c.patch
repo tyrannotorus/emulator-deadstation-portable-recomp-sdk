@@ -1,0 +1,40 @@
+diff --git a/src/rt/hle_data.c b/src/rt/hle_data.c
+index 12f2a9a9..ea577e8d 100644
+--- a/src/rt/hle_data.c
++++ b/src/rt/hle_data.c
+@@ -2791,13 +2791,25 @@ uint32_t io_async_complete_fd(uint32_t fd) {
+     return 0u;
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* set when an async request is submitted, cleared by a pass that finds none pending: every import
++ * call ran this pass over all 64 descriptors */
++int g_io_async_maybe_pending = 1;
++#endif
+ void io_async_dispatch_tick(void) {
+     s_io_dispatch_epoch++;
++#ifdef SR_GE_NATIVE
++    if (!g_io_async_maybe_pending) return;
++    int pending = 0;
++#endif
+     uint32_t selected = UINT32_MAX;
+     int32_t selected_priority = INT32_MAX;
+     uint64_t selected_sequence = UINT64_MAX;
+     for (uint32_t fd = 0; fd < sizeof(s_fds) / sizeof(s_fds[0]); fd++) {
+         IoAsyncRequest *request = &s_fds[fd].async;
++#ifdef SR_GE_NATIVE
++        pending |= request->state == IO_ASYNC_PENDING;
++#endif
+         if (request->state != IO_ASYNC_PENDING ||
+             s_io_dispatch_epoch - request->submitted_epoch < 2u)
+             continue;
+@@ -2808,6 +2820,9 @@ void io_async_dispatch_tick(void) {
+             selected_sequence = request->sequence;
+         }
+     }
++#ifdef SR_GE_NATIVE
++    if (!pending) g_io_async_maybe_pending = 0;
++#endif
+     if (selected != UINT32_MAX) (void)io_async_complete_fd(selected);
+ }
+ #ifdef SR_HLE_THREAD_SELFTEST

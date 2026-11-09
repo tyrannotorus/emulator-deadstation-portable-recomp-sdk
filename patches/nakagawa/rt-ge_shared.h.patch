@@ -1,0 +1,56 @@
+diff --git a/src/rt/ge_shared.h b/src/rt/ge_shared.h
+index 803247d3..d0cee1ac 100644
+--- a/src/rt/ge_shared.h
++++ b/src/rt/ge_shared.h
+@@ -401,12 +401,31 @@ typedef struct GeTnlParams {
+     float mat_spe[3];                      /* material specular colour */
+     float spec_coef;                       /* the specular power, as GeState */
+     GeTnlLight light[GE_TNL_LIGHTS];
++    /* texture coordinate generation on the GPU: the texgen matrix, the map mode (bits 0-1) and its
++     * source (bits 8-9) as TEXMAPMODE, and the environment map's two light directions, normalized */
++    float tgen[12];
++    uint32_t texmap;
++    float env[6];
++    /* the vertex format psp_tnl.vert decodes the raw vertex bytes by: vfmt[0] the offsets of position, normal, uv,
++     * colour (a byte each, 0xFF absent), vfmt[1] their formats (4 bits each: position, normal, uv, colour) and the weights'
++     * format (bits 16-19) and count (bits 20-23), vfmt[2] the weights' offset (bits 0-7) and the stride (bits 8-23); and the
++     * colour of a vertex without one (the material's, r in the low byte) */
++    uint32_t vfmt[3];
++    uint32_t absent_color;
++    /* the PSP's triangle drops in psp_tnl.vert: bit 0 depth clip (GeState depth_clip), and a NaN
++     * (0x7FC00000) a dropped vertex's position takes, read at run time as PPSSPP's u_cullRangeMax.w is */
++    uint32_t cull;
++    uint32_t nan_bits;
+ } GeTnlParams;
+ 
+ /* A PRIM for tnl_prim: `refs` holds `nrefs` vertex references in PRIM order, `tri` holds
+  * `ntri` index triples into refs, each in the order ge.c submits that triangle (the cull and
+  * strip-parity flips applied), so triangle k's vertices are refs[tri[3k]], refs[tri[3k+1]] and
+  * refs[tri[3k+2]]. `box` bounds the projected vertices (from ge.c's clip-space bound). */
++/* ge.c's list runs and CLUT loads, counted: the backend's texture lookup reuses its last answer
++ * within one run while neither moved */
++extern uint32_t g_ge_run_gen, g_ge_clut_gen;
++
+ typedef struct GeTnlPrim {
+     const GeTnlParams *params;
+     const GeTnlVtx *refs;
+@@ -414,6 +433,19 @@ typedef struct GeTnlPrim {
+     const uint32_t *tri;
+     uint32_t ntri;
+     float box[4];                      /* x0, y0, x1, y1: framebuffer pixels every vertex is in */
++    /* the vertices as raw bytes (the guest's, or GeTnlVtx records for a morphing PRIM): `tri` then holds byte
++     * offsets into them, three per triangle, and refs/nrefs are unused */
++    const uint8_t *raw;
++    uint32_t raw_bytes;
++    const uint32_t *vtx_off;           /* each of the nrefs vertices' byte offset in raw; tri indexes them */
++    uint32_t params_id;                /* the same id: the same record as the last PRIM's (0: compare it) */
++    uint32_t vtx_stride;               /* with vtx_off NULL: vertex u's offset is u * vtx_stride */
++    const uint16_t *tri16;             /* set: `tri` as 16-bit indices, read in its place */
++    /* ring != 0: ge.c wrote the PRIM's record, raw vertices, corners and indices into the renderer's T&L ring
++     * (gegpu_ring_get): its first index there, its record's byte offset, and per region (0 indices, 1 the rest) the oldest
++     * position it reads and the ring's end after it */
++    uint32_t ring, ring_first, ring_param;
++    uint64_t ring_lo[2], ring_end[2];
+ } GeTnlPrim;
+ 
+ /* Implemented in ge.c. */

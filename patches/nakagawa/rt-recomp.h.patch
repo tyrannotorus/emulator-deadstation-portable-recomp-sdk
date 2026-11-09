@@ -1,0 +1,354 @@
+diff --git a/src/rt/recomp.h b/src/rt/recomp.h
+index 5ec189af..6c74328f 100644
+--- a/src/rt/recomp.h
++++ b/src/rt/recomp.h
+@@ -269,6 +269,27 @@ _Static_assert(sizeof(CpuState) == 1000u, "CpuState size drift");
+  * lands inside the allocation. Keeping SR_RAM_BASE at 0x08000000 means the recompiled code's
+  * MEM_* macros are unchanged (no rebuild of the big object). */
+ extern uint8_t *g_mem;
++#ifdef SR_MEM_FIXED
++/* The guest's arena at a fixed host address: sr_mem_init maps it there or stops.
++ * The accessors' base is then a constant, never reloaded from g_mem after a guest store (the generated code is built without strict
++ * aliasing, so any store could have changed a global pointer). */
++#define SR_MEM_FIXED_ARENA 0x1000000000ull
++#ifdef SR_CPU_NATIVE
++/* Fastmem. Two views of one memory (a memfd): the guest's view at SR_MEM_FIXED_ARENA, 4 GiB,
++ * where every guest address is its own offset (each of the eight 512 MiB mirrors SR_PHYS folds: scratchpad and main RAM read and
++ * write, VRAM read only, the rest unmapped), and the host's view 4 GiB above it (all of guest physical [0, 0x0c010000), read and
++ * write) that the runtime, the HLE and the GE use. A guest load or store is one host instruction; one the guest view refuses (a
++ * store to VRAM, the GE status word, the swizzled VRAM views, an address outside the arena) faults, and recomp.c's handler runs it
++ * through the full accessors (sr_*_ref: VRAM's dirty marks, the slow bodies' reports) and goes on after it. */
++#define SR_FASTMEM 1
++#define SR_HOST_VIEW (SR_MEM_FIXED_ARENA + 0x100000000ull)
++#define SR_RAM_HOST ((uint8_t *)(uintptr_t)(SR_HOST_VIEW + 0x08000000ull))
++#else
++#define SR_RAM_HOST ((uint8_t *)(uintptr_t)(SR_MEM_FIXED_ARENA + 0x08000000ull))
++#endif
++#else
++#define SR_RAM_HOST g_mem
++#endif
+ #define SR_RAM_BASE 0x08000000u
+ #define SR_PHYS(a)  ((a) & 0x1FFFFFFFu)
+ #define SR_VRAM_CPU_BASE 0x04000000u
+@@ -344,12 +365,12 @@ static inline void sr_guest_span_report_vram_mirror_boundary(const char *caller)
+ /* Signed offset so addresses below SR_RAM_BASE map below g_mem.
+  * With SR_RAM_BASE=0x08000000, RAM starts at g_mem and VRAM/eDRAM at 0x04000000 is at g_mem - 0x04000000. */
+ static inline uint8_t *sr_host_address(uint32_t address) {
+-    return g_mem + (int32_t)(sr_vram_cpu_address(address) - SR_RAM_BASE);
++    return SR_RAM_HOST + (int32_t)(sr_vram_cpu_address(address) - SR_RAM_BASE);
+ }
+ #define SR_HOST(a)  sr_host_address((uint32_t)(a))
+ /* Scalar accessors use this only after proving a normal-RAM/non-mirror span, keeping
+  * the common path to one VRAM-range test rather than repeating alias translation. */
+-#define SR_HOST_LINEAR(a) (g_mem + (int32_t)(SR_PHYS(a) - SR_RAM_BASE))
++#define SR_HOST_LINEAR(a) (SR_RAM_HOST + (int32_t)(SR_PHYS(a) - SR_RAM_BASE))
+ 
+ /* The arena covers guest physical [0, 0x0c000000). */
+ static inline int sr_inrange(uint32_t a) {
+@@ -428,10 +449,19 @@ static inline int sr_guest_span_readable_current_at(uint32_t addr, uint32_t size
+ }
+ 
+ /* Call sites keep the short names; the boundary report names the calling function. */
++#if defined(SR_MEM_FIXED) && defined(SR_CPU_NATIVE)
++/* a span starting in main RAM passes at once (the guard page takes its end): a VFPU quad's
++ * load or store tests it at every use */
++#define sr_guest_span_readable(addr, size) \
++    ((((SR_PHYS((uint32_t)(addr))) >> 26) == 2u && (size) <= 0x10000u) || sr_guest_span_readable_at((addr), (size), __func__))
++#define sr_guest_span_writable(addr, size) \
++    ((((SR_PHYS((uint32_t)(addr))) >> 26) == 2u && (size) <= 0x10000u) || sr_guest_span_writable_at((addr), (size), __func__))
++#else
+ #define sr_guest_span_readable(addr, size) \
+     sr_guest_span_readable_at((addr), (size), __func__)
+ #define sr_guest_span_writable(addr, size) \
+     sr_guest_span_writable_at((addr), (size), __func__)
++#endif
+ #define sr_guest_span_readable_current(addr, size) \
+     sr_guest_span_readable_current_at((addr), (size), __func__)
+ 
+@@ -942,41 +972,103 @@ static inline __attribute__((noinline)) void sr_w32_pc_slow(uint32_t a, uint32_t
+  * instrumentation armed is a plain host access, small enough to inline; everything else
+  * (VRAM, the GE status word, out-of-range addresses, watches) takes the *_slow body. */
+ static inline uint32_t sr_ram_offset(uint32_t a) { return SR_PHYS(a) - SR_RAM_BASE; }
++#ifdef SR_CPU_NATIVE
++/* no store instrumentation (store context, last writer, watches, heap watch: the runtime's dev tools) in a native
++ * build: a RAM store is a store, with no five globals loaded and tested before it */
++static inline int sr_store_plain(void) { return 1; }
++#else
+ static inline int sr_store_plain(void) {
+     return !(g_sr_store_context_pc | (uint32_t)g_sr_last_writer_enabled |
+              (uint32_t)g_sr_mem_watch_count | (uint32_t)g_sr_heap_watch |
+              (uint32_t)SR_WATCH_ACTIVE());
+ }
+-static inline uint8_t sr_r8(uint32_t a) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o < 0x04000000u, 1)) return g_mem[o];
++#endif
++#ifdef SR_GE_NATIVE
++/* VRAM is memory: the plain view (0x04000000, 2 MiB, below main RAM in the arena) loaded and
++ * stored inline like RAM (not the swizzled depth views, nor the GE status word Nakagawa answers at 0x04084000). A store tells the
++ * renderer which textures and CPU-written targets to drop (sr_gpu_vram_dirty: the GE worker's queue). */
++void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
++static inline int sr_vram_plain(uint32_t a, uint32_t n) {
++    const uint32_t v = SR_PHYS(a) - 0x04000000u;
++    return v <= 0x00200000u - n && (v & ~3u) != 0x00084000u;
++}
++#define SR_VRAM_HOST(a) (SR_RAM_HOST + (int32_t)(SR_PHYS(a) - SR_RAM_BASE))
++#endif
++#if defined(SR_MEM_FIXED) && defined(SR_CPU_NATIVE)
++/* Main RAM's test on the masked address itself: bits 26-28 = 2 is 0x08000000-0x0BFFFFFF,
++ * and the arena (fixed, RAM at +0x08000000) is reached at the masked address with no subtraction; a guard page past RAM's end
++ * takes the last bytes of a wider access. A shift, a compare with a small immediate and a branch: no 32-bit bound built and no
++ * offset subtracted at every guest load and store. */
++#define SR_ARENA_HOST ((uint8_t *)(uintptr_t)SR_MEM_FIXED_ARENA)
++#define SR_RAM_FAST(p) (((p) >> 26) == 2u)
++#define SR_RAM_AT(p) (SR_ARENA_HOST + (p))
++#else
++#define SR_RAM_FAST(p) ((p) - SR_RAM_BASE < 0x04000000u)
++#define SR_RAM_AT(p) (SR_RAM_HOST + ((p) - SR_RAM_BASE))
++#endif
++#ifdef SR_FASTMEM
++#define SR_ACC(name) name##_ref   /* the full accessors, for the fault handler */
++#else
++#define SR_ACC(name) name
++#endif
++static inline uint8_t SR_ACC(sr_r8)(uint32_t a) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p), 1)) return *SR_RAM_AT(p);
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 1u)) return *SR_VRAM_HOST(a);
++#endif
+     return sr_r8_slow(a);
+ }
+-static inline uint16_t sr_r16(uint32_t a) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o <= 0x04000000u - 2u, 1)) { uint16_t v; memcpy(&v, g_mem + o, 2); return v; }
++static inline uint16_t SR_ACC(sr_r16)(uint32_t a) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p), 1)) { uint16_t v; memcpy(&v, SR_RAM_AT(p), 2); return v; }
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 2u)) { uint16_t v; memcpy(&v, SR_VRAM_HOST(a), 2); return v; }
++#endif
+     return sr_r16_slow(a);
+ }
+-static inline uint32_t sr_r32(uint32_t a) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o <= 0x04000000u - 4u, 1)) { uint32_t v; memcpy(&v, g_mem + o, 4); return v; }
++static inline uint32_t SR_ACC(sr_r32)(uint32_t a) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p), 1)) { uint32_t v; memcpy(&v, SR_RAM_AT(p), 4); return v; }
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 4u)) { uint32_t v; memcpy(&v, SR_VRAM_HOST(a), 4); return v; }
++#endif
+     return sr_r32_slow(a);
+ }
+-static inline void sr_w8_pc(uint32_t a, uint8_t v, uint32_t pc) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o < 0x04000000u && sr_store_plain(), 1)) { g_mem[o] = v; return; }
++static inline void SR_ACC(sr_w8_pc)(uint32_t a, uint8_t v, uint32_t pc) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p) && sr_store_plain(), 1)) { *SR_RAM_AT(p) = v; return; }
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 1u) && sr_store_plain()) { *SR_VRAM_HOST(a) = v; sr_gpu_vram_dirty(SR_PHYS(a), 1u); return; }
++#endif
+     sr_w8_pc_slow(a, v, pc);
+ }
+-static inline void sr_w16_pc(uint32_t a, uint16_t v, uint32_t pc) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o <= 0x04000000u - 2u && sr_store_plain(), 1)) { memcpy(g_mem + o, &v, 2); return; }
++static inline void SR_ACC(sr_w16_pc)(uint32_t a, uint16_t v, uint32_t pc) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p) && sr_store_plain(), 1)) { memcpy(SR_RAM_AT(p), &v, 2); return; }
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 2u) && sr_store_plain()) { memcpy(SR_VRAM_HOST(a), &v, 2); sr_gpu_vram_dirty(SR_PHYS(a), 2u); return; }
++#endif
+     sr_w16_pc_slow(a, v, pc);
+ }
+-static inline void sr_w32_pc(uint32_t a, uint32_t v, uint32_t pc) {
+-    const uint32_t o = sr_ram_offset(a);
+-    if (__builtin_expect(o <= 0x04000000u - 4u && sr_store_plain(), 1)) { memcpy(g_mem + o, &v, 4); return; }
++static inline void SR_ACC(sr_w32_pc)(uint32_t a, uint32_t v, uint32_t pc) {
++    const uint32_t p = SR_PHYS(a);
++    if (__builtin_expect(SR_RAM_FAST(p) && sr_store_plain(), 1)) { memcpy(SR_RAM_AT(p), &v, 4); return; }
++#ifdef SR_GE_NATIVE
++    if (sr_vram_plain(a, 4u) && sr_store_plain()) { memcpy(SR_VRAM_HOST(a), &v, 4); sr_gpu_vram_dirty(SR_PHYS(a), 4u); return; }
++#endif
+     sr_w32_pc_slow(a, v, pc);
+ }
++#ifdef SR_FASTMEM
++/* the guest's view: one host load or store */
++#define SR_GUEST_VIEW ((uint8_t *)(uintptr_t)SR_MEM_FIXED_ARENA)
++static inline uint8_t sr_r8(uint32_t a) { return SR_GUEST_VIEW[a]; }
++static inline uint16_t sr_r16(uint32_t a) { uint16_t v; memcpy(&v, SR_GUEST_VIEW + a, 2); return v; }
++static inline uint32_t sr_r32(uint32_t a) { uint32_t v; memcpy(&v, SR_GUEST_VIEW + a, 4); return v; }
++static inline void sr_w8_pc(uint32_t a, uint8_t v, uint32_t pc) { (void)pc; SR_GUEST_VIEW[a] = v; }
++static inline void sr_w16_pc(uint32_t a, uint16_t v, uint32_t pc) { (void)pc; memcpy(SR_GUEST_VIEW + a, &v, 2); }
++static inline void sr_w32_pc(uint32_t a, uint32_t v, uint32_t pc) { (void)pc; memcpy(SR_GUEST_VIEW + a, &v, 4); }
++#endif
+ static inline void sr_w8 (uint32_t a, uint8_t v) { sr_w8_pc(a, v, 0); }
+ static inline void sr_w16(uint32_t a, uint16_t v) { sr_w16_pc(a, v, 0); }
+ static inline void sr_w32(uint32_t a, uint32_t v) { sr_w32_pc(a, v, 0); }
+@@ -1125,6 +1217,27 @@ int sr_guest_format_host(CpuState *s, uint32_t fmt, uint32_t first_reg,
+  * (saturate) and write mask, then stores. The prefix value comes from s->vfpuCtrl. */
+ void sr_vread(float *r, const CpuState *s, const uint8_t *idx, int n, uint32_t prefix);
+ void sr_vwrite(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefix);
++#ifndef SR_RECOMP_C
++/* a VFPU operand's plain case inline: no source prefix (identity swizzle 0xE4), no
++ * destination prefix; a prefixed one is the runtime's (recomp.c) */
++static inline void sr_vread_fast(float *r, const CpuState *s, const uint8_t *idx, int n, uint32_t prefix) {
++    if (__builtin_expect(prefix == 0xe4u, 1)) {
++        for (int i = 0; i < n && i < 4; i++) r[i] = s->v[idx[i]];
++        return;
++    }
++    sr_vread(r, s, idx, n, prefix);
++}
++static inline void sr_vwrite_fast(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefix) {
++    if (__builtin_expect(dprefix == 0u, 1)) {
++        for (int i = 0; i < n; i++) s->v[idx[i]] = d[i];
++        return;
++    }
++    sr_vwrite(s, idx, d, n, dprefix);
++}
++/* variadic: a compound-literal index list's commas pass through as they were written */
++#define sr_vread(...) sr_vread_fast(__VA_ARGS__)
++#define sr_vwrite(...) sr_vwrite_fast(__VA_ARGS__)
++#endif
+ 
+ /* VFPU lane arithmetic with the NaN result fixed by rule (issue #326). C leaves the NaN
+  * that a NaN-producing operation returns to the host: x86-64 SSE keeps the first NaN
+@@ -1156,10 +1269,18 @@ static inline float sr_vf_nan(float a, float b) {
+     memcpy(&r, &u, 4);
+     return r;
+ }
++#ifdef SR_FPU_NATIVE
++/* the host's arithmetic: no PSP NaN payload chosen after each lane operation */
++static inline float sr_vf_add(float a, float b) { return a + b; }
++static inline float sr_vf_sub(float a, float b) { return a - b; }
++static inline float sr_vf_mul(float a, float b) { return a * b; }
++static inline float sr_vf_div(float a, float b) { return a / b; }
++#else
+ static inline float sr_vf_add(float a, float b) { const float r = a + b; return r == r ? r : sr_vf_nan(a, b); }
+ static inline float sr_vf_sub(float a, float b) { const float r = a - b; return r == r ? r : sr_vf_nan(a, b); }
+ static inline float sr_vf_mul(float a, float b) { const float r = a * b; return r == r ? r : sr_vf_nan(a, b); }
+ static inline float sr_vf_div(float a, float b) { const float r = a / b; return r == r ? r : sr_vf_nan(a, b); }
++#endif
+ 
+ /* VFPU transcendentals, exact ports of PPSSPP's table-based kernels (the PSP hardware does
+  * not compute these with IEEE math). The lookup tables are loaded once from assets/vfpu/
+@@ -1173,6 +1294,29 @@ float sr_vfpu_log2(float x);
+ float sr_vfpu_sin(float x);
+ float sr_vfpu_cos(float x);
+ float sr_vfpu_exp2(float x);
++#if defined(SR_FPU_NATIVE) && !defined(SR_RECOMP_C)
++/* The VFPU's transcendentals as the host's float math, inline: angles in quarter turns
++ * (vsin(x) = sin(x pi/2)), reduced modulo four quarter turns exactly first so a game's accumulated angle keeps its period; vasin
++ * in quarter turns. Not the PSP's table-driven bit patterns (lookups, a binary search and a bit-by-bit root per call). */
++#include <math.h>
++static inline float sr_vfpu_quarter_reduce(float x) { return x - 4.0f * floorf(x * 0.25f); }
++static inline float sr_vfpu_sin_native(float x) { return sinf(sr_vfpu_quarter_reduce(x) * 1.57079632679489661923f); }
++static inline float sr_vfpu_cos_native(float x) { return cosf(sr_vfpu_quarter_reduce(x) * 1.57079632679489661923f); }
++static inline float sr_vfpu_asin_native(float x) { return asinf(x) * 0.63661977236758134308f; }
++static inline float sr_vfpu_rcp_native(float x) { return 1.0f / x; }
++static inline float sr_vfpu_rsqrt_native(float x) { return 1.0f / sqrtf(x); }
++static inline float sr_vfpu_sqrt_native(float x) { return sqrtf(x); }
++static inline float sr_vfpu_log2_native(float x) { return log2f(x); }
++static inline float sr_vfpu_exp2_native(float x) { return exp2f(x); }
++#define sr_vfpu_sin(x) sr_vfpu_sin_native(x)
++#define sr_vfpu_cos(x) sr_vfpu_cos_native(x)
++#define sr_vfpu_asin(x) sr_vfpu_asin_native(x)
++#define sr_vfpu_rcp(x) sr_vfpu_rcp_native(x)
++#define sr_vfpu_rsqrt(x) sr_vfpu_rsqrt_native(x)
++#define sr_vfpu_sqrt(x) sr_vfpu_sqrt_native(x)
++#define sr_vfpu_log2(x) sr_vfpu_log2_native(x)
++#define sr_vfpu_exp2(x) sr_vfpu_exp2_native(x)
++#endif
+ 
+ /* Single-instruction VFPU interpreter (src/rt/vfpu_interp.c). Returns SR_VFPU_COMPUTE for a
+  * value-producing op (compare v[]/f[] to the reference trace), SR_VFPU_STATE for a prefix,
+@@ -1677,6 +1821,45 @@ extern SrAotReturnBoundary *sr_aot_return_boundary_top;
+ int sr_aot_return_boundary_begin(CpuState *s, uint32_t resume_pc,
+                                  uint32_t call_pc, uint32_t has_resume_pc);
+ int sr_aot_return_boundary_end(CpuState *s);
++#if !defined(SR_VERIFY) && !defined(SR_RECOMP_C)
++/* the boundary around every linked call, its plain case inline: a push while the stack has
++ * room, a pop when the call returned where it should, nothing unwinding; every other case is the runtime's own (recomp.c), which
++ * checks it all again. */
++extern SrAotReturnBoundary *sr_aot_return_boundaries;
++extern size_t sr_aot_return_boundary_depth, sr_aot_return_boundary_capacity, sr_aot_return_boundary_floor;
++static inline int sr_aot_return_boundary_begin_fast(CpuState *s, uint32_t resume_pc, uint32_t call_pc, uint32_t has_resume_pc) {
++    if (__builtin_expect(sr_aot_return_boundary_depth == sr_aot_return_boundary_capacity, 0))
++        return sr_aot_return_boundary_begin(s, resume_pc, call_pc, has_resume_pc);
++    SrAotReturnBoundary *b = &sr_aot_return_boundaries[sr_aot_return_boundary_depth++];
++    b->state = s;
++    b->resume_pc = resume_pc;
++    b->has_resume_pc = has_resume_pc != 0u;
++    b->observed_target = 0u;
++    b->call_sp = s->r[29];
++    b->dispatch_owned = 0u;
++    b->unwinding = 0u;
++    b->resume_sp = 0u;
++    sr_aot_return_boundary_top = b;
++    return 0;
++}
++static inline int sr_aot_return_boundary_end_fast(CpuState *s) {
++    if (__builtin_expect(sr_aot_return_boundary_depth > sr_aot_return_boundary_floor, 1)) {
++        SrAotReturnBoundary *b = sr_aot_return_boundary_top;
++        if (__builtin_expect(b == &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] && b->state == s &&
++                             b->unwinding == 0u && s->flow_kind != SR_FLOW_FATAL &&
++                             (!b->has_resume_pc || s->flow_kind != SR_FLOW_NONE || b->observed_target == 0u ||
++                              (uint32_t)b->observed_target == b->resume_pc), 1)) {
++            sr_aot_return_boundary_depth--;
++            sr_aot_return_boundary_top = sr_aot_return_boundary_depth
++                ? &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] : NULL;
++            return 0;
++        }
++    }
++    return sr_aot_return_boundary_end(s);
++}
++#define sr_aot_return_boundary_begin(...) sr_aot_return_boundary_begin_fast(__VA_ARGS__)
++#define sr_aot_return_boundary_end(...) sr_aot_return_boundary_end_fast(__VA_ARGS__)
++#endif
+ /* How many guest returns past their caller the runtime has unwound (#1034). */
+ uint64_t sr_aot_return_unwind_count(void);
+ void sr_aot_return_boundaries_reset(void);
+@@ -2255,6 +2438,33 @@ uint64_t sr_profile_test_lookup_drops(void);
+ #define SR_VERIFY_NOTE_YIELD() ((void)0)
+ #endif
+ 
++#ifdef SR_CPU_NATIVE
++/* Guest code runs on one host thread, the only one that counts the slice down; the others only end it early (a store
++ * of 1). A relaxed load and store, not a read-modify-write loop at every guest call: a store of 1 lost between them leaves the
++ * slice at most TIMESLICE yields longer. No block profile. */
++#define SR_YIELD(s, target_pc) do { \
++    const uint32_t _sr_slice = (uint32_t)atomic_load_explicit(&sr_timeslice, memory_order_relaxed); \
++    atomic_store_explicit(&sr_timeslice, (int_least32_t)(_sr_slice - 1u), memory_order_relaxed); \
++    if (__builtin_expect((int32_t)_sr_slice <= 1, 0) && sr_sched_on) { \
++        (s)->pc = (target_pc); \
++        SR_VERIFY_NOTE_YIELD(); \
++        sr_yield(s); \
++    } \
++} while (0)
++/* The same for a function whose registers are C locals (tools/promote_registers.py): WB stores the dirty ones before the yield,
++ * RL loads them all after it, only on the slow path */
++#define SR_YIELD_SYNC(s, target_pc, WB, RL) do { \
++    const uint32_t _sr_slice = (uint32_t)atomic_load_explicit(&sr_timeslice, memory_order_relaxed); \
++    atomic_store_explicit(&sr_timeslice, (int_least32_t)(_sr_slice - 1u), memory_order_relaxed); \
++    if (__builtin_expect((int32_t)_sr_slice <= 1, 0) && sr_sched_on) { \
++        WB \
++        (s)->pc = (target_pc); \
++        SR_VERIFY_NOTE_YIELD(); \
++        sr_yield(s); \
++        RL \
++    } \
++} while (0)
++#else
+ #define SR_YIELD(s, target_pc) do { \
+     if (__builtin_expect(g_prof_enabled, 0)) { \
+         sr_profile_block(target_pc); \
+@@ -2267,6 +2477,7 @@ uint64_t sr_profile_test_lookup_drops(void);
+         } \
+     } \
+ } while (0)
++#endif
+ 
+ 
+ 

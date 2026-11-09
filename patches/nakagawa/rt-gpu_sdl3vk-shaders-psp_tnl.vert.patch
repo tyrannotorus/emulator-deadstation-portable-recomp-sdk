@@ -1,0 +1,562 @@
+diff --git a/src/rt/gpu_sdl3vk/shaders/psp_tnl.vert b/src/rt/gpu_sdl3vk/shaders/psp_tnl.vert
+index 5d24f2e6..d0af25a7 100644
+--- a/src/rt/gpu_sdl3vk/shaders/psp_tnl.vert
++++ b/src/rt/gpu_sdl3vk/shaders/psp_tnl.vert
+@@ -34,20 +34,35 @@
+  *     operands and quotients as well.
+  *   - Constants that C folds (1.0f/255.0f) are their float bit patterns. */
+ 
+-#extension GL_EXT_spirv_intrinsics : require
+-spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 32);
++/* no DenormPreserve: the GPU's own subnormal handling (the GE8300 lacks the mode) */
+ 
+-layout(location = 0) in vec3  in_pos;
+-layout(location = 1) in vec3  in_nrm;
+-layout(location = 2) in vec2  in_uv;
+-layout(location = 3) in uvec4 in_color;    /* R8G8B8A8_UINT */
+-layout(location = 4) in vec4  in_w0;
+-layout(location = 5) in vec4  in_w1;
+-layout(location = 6) in uint  in_param;    /* record index, relative to gl_InstanceIndex */
++/* a triangle corner: its vertex's byte offset in the raw vertex bytes (binding 1), and its
++ * record; the vertex is decoded here by the record's format (P_VFMT), as ge.c's read_pos/nrm/tc/color/weights would */
++layout(location = 0) in uint  in_off;
++layout(location = 1) in uint  in_param;    /* record index, relative to gl_InstanceIndex */
++vec3  in_pos;
++vec3  in_nrm;
++vec2  in_uv;
++uvec4 in_color;
++vec4  in_w0;
++vec4  in_w1;
+ 
+ /* GeTnlParams, as 32-bit words. Offsets (in words) follow the C struct. */
+-layout(std430, set = 1, binding = 0) readonly buffer TnlParams { uint words[]; } tnl;
+-#define P_WORDS    247
++/* a draw's one record as a uniform buffer (a dynamic offset a draw): its matrices, bones and lights
++ * read once a draw into the GPU's shared registers, not from memory at every vertex (~10 ms a frame of the GE8300's vertex work) */
++layout(std140, set = 1, binding = 0) uniform TnlParams { uvec4 words[68]; } tnl;   /* P_WORDS / 4 */
++layout(std430, set = 1, binding = 1) readonly buffer TnlRaw { uint raw[]; } tnlraw;
++/* Vert+ (psp.vert's): k_vpad rows above and below the guest's 272 in every target */
++layout(constant_id = 10) const float k_vpad = 0.0;
++layout(constant_id = 11) const float k_yscale = 1.0 / 136.0;
++#define P_WORDS    272   /* with texgen (19 words), the vertex format (4) and cull (2) */
++#define P_CULL     270
++#define P_NAN      271
++#define P_VFMT     266
++#define P_ABSENT   269
++#define P_TGEN     247
++#define P_TEXMAP   259
++#define P_ENV      260
+ #define P_WORLD    0
+ #define P_VIEW     12
+ #define P_PROJ     24
+@@ -71,17 +86,70 @@ layout(std430, set = 1, binding = 0) readonly buffer TnlParams { uint words[]; }
+ #define P_LIGHT    175
+ #define L_WORDS    18     /* on, point, l[3], acol[3], dcol[3], att[3], comp, scol[3] */
+ 
+-layout(location = 0) noperspective out vec2  v_uv;
+-layout(location = 1) noperspective out float v_rw;
++layout(location = 0) out vec2  v_uv;      /* u, v with perspective; rw = 1 (the GPU divides) */
++layout(location = 1) out float v_rw;
+ layout(location = 2) noperspective out float v_fog;
+ layout(location = 3) noperspective out vec4  v_color;
+ layout(location = 4) flat out vec4 v_uvbox;
++layout(location = 5) flat out vec4 v_color_flat;
+ 
+-precise gl_Position;
+ 
+-uint s_base;
+-float pf(int i) { return uintBitsToFloat(tnl.words[s_base + uint(i)]); }
+-uint  pu(int i) { return tnl.words[s_base + uint(i)]; }
++float pf(int i) { return uintBitsToFloat(tnl.words[i >> 2][i & 3]); }
++uint  pu(int i) { return tnl.words[i >> 2][i & 3]; }
++
++/* the raw vertex bytes: a byte, a halfword (aligned to 2, as PSP vertex fields are), a word */
++uint rb8(uint o)  { return (tnlraw.raw[o >> 2] >> ((o & 3u) * 8u)) & 0xFFu; }
++uint rb16(uint o) { return (tnlraw.raw[o >> 2] >> ((o & 2u) * 8u)) & 0xFFFFu; }
++uint rb32(uint o) { return tnlraw.raw[o >> 2]; }
++float s8f(uint v)  { return float(int(v << 24u) >> 24); }
++float s16f(uint v) { return float(int(v << 16u) >> 16); }
++/* a signed triple (position, normal): float, s16 / 32768, s8 / 128 (ge.c read_pos_one, read_nrm_one) */
++vec3 dec3s(uint o, uint f) {
++    if (f == 3u) return vec3(uintBitsToFloat(rb32(o)), uintBitsToFloat(rb32(o + 4u)), uintBitsToFloat(rb32(o + 8u)));
++    if (f == 2u) return vec3(s16f(rb16(o)), s16f(rb16(o + 2u)), s16f(rb16(o + 4u))) * (1.0 / 32768.0);
++    return vec3(s8f(rb8(o)), s8f(rb8(o + 1u)), s8f(rb8(o + 2u))) * (1.0 / 128.0);
++}
++/* the corner's vertex, by the record's format (ge.c's readers; unpack_color's expansions) */
++void decode_vertex() {
++    uint v0 = pu(P_VFMT + 0), v1 = pu(P_VFMT + 1), v2 = pu(P_VFMT + 2);
++    uint o = in_off;
++    uint po = v0 & 255u, no = (v0 >> 8) & 255u, to = (v0 >> 16) & 255u, co = v0 >> 24;
++    uint pf_ = v1 & 15u, nf = (v1 >> 4) & 15u, tf = (v1 >> 8) & 15u, cf = (v1 >> 12) & 15u;
++    uint wf = (v1 >> 16) & 15u, wn = (v1 >> 20) & 15u, wo = v2 & 255u;
++    in_pos = dec3s(o + po, pf_);
++    in_nrm = no == 255u ? vec3(0.0, 0.0, 1.0) : dec3s(o + no, nf);
++    if (to == 255u) in_uv = vec2(0.0);
++    else if (tf == 3u) in_uv = vec2(uintBitsToFloat(rb32(o + to)), uintBitsToFloat(rb32(o + to + 4u)));
++    else if (tf == 2u) in_uv = vec2(float(rb16(o + to)), float(rb16(o + to + 2u))) * (1.0 / 32768.0);
++    else in_uv = vec2(float(rb8(o + to)), float(rb8(o + to + 1u))) * (1.0 / 128.0);
++    uint c;
++    if (co == 255u) {
++        c = pu(P_ABSENT);
++        in_color = uvec4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24);
++    } else if (cf == 7u) {
++        c = rb32(o + co);
++        in_color = uvec4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24);
++    } else {
++        c = rb16(o + co);
++        if (cf == 4u) {
++            uint r5 = c & 31u, g6 = (c >> 5) & 63u, b5 = (c >> 11) & 31u;
++            in_color = uvec4((r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2), 255u);
++        } else if (cf == 5u) {
++            uint r5 = c & 31u, g5 = (c >> 5) & 31u, b5 = (c >> 10) & 31u;
++            in_color = uvec4((r5 << 3) | (r5 >> 2), (g5 << 3) | (g5 >> 2), (b5 << 3) | (b5 >> 2), (c & 0x8000u) != 0u ? 255u : 0u);
++        } else {
++            in_color = uvec4((c & 15u) * 17u, ((c >> 4) & 15u) * 17u, ((c >> 8) & 15u) * 17u, ((c >> 12) & 15u) * 17u);
++        }
++    }
++    float w[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
++    for (uint i = 0u; i < wn && i < 8u; i++) {
++        if (wf == 3u) w[i] = uintBitsToFloat(rb32(o + wo + 4u * i));
++        else if (wf == 2u) w[i] = float(rb16(o + wo + 2u * i)) * (1.0 / 32768.0);
++        else w[i] = float(rb8(o + wo + i)) * (1.0 / 128.0);
++    }
++    in_w0 = vec4(w[0], w[1], w[2], w[3]);
++    in_w1 = vec4(w[4], w[5], w[6], w[7]);
++}
+ 
+ /* The significand of a nonzero float as an integer with its leading one at bit 23, and the
+  * biased exponent e for which |a| = m * 2^(e - 150); a subnormal is normalised. */
+@@ -97,62 +165,13 @@ uint sig24(uint ua, out int e) {
+  * whose quotient does not overflow: restoring division of the 24-bit significands, 24 bits
+  * plus a round bit, and a sticky bit; a quotient below the normal range is shifted into the
+  * subnormal range before it is rounded. */
+-float div_rn(float a, float b) {
+-    uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
+-    uint sign = (ua ^ ub) & 0x80000000u;
+-    if ((ua & 0x7fffffffu) == 0u) return uintBitsToFloat(sign);
+-    int ea, eb;
+-    uint ma = sig24(ua, ea), mb = sig24(ub, eb);
+-    int e = ea - eb + 127;
+-    if (ma < mb) { ma <<= 1; e -= 1; }
+-    uint q = 0u, r = ma;
+-    for (int i = 0; i < 25; i++) {
+-        q <<= 1;
+-        if (r >= mb) { r -= mb; q |= 1u; }
+-        r <<= 1;
+-    }
+-    uint sticky = r != 0u ? 1u : 0u;
+-    if (e < 1) {
+-        int sh = 1 - e;
+-        if (sh > 25) return uintBitsToFloat(sign);
+-        if ((q & ((1u << uint(sh)) - 1u)) != 0u) sticky = 1u;
+-        q >>= uint(sh);
+-        e = 0;
+-    }
+-    uint round_bit = q & 1u;
+-    q >>= 1;
+-    if (round_bit != 0u && (sticky != 0u || (q & 1u) != 0u)) q += 1u;
+-    if (e == 0) return uintBitsToFloat(sign | q);     /* 0x800000 is the smallest normal */
+-    if (q == 0x1000000u) { q >>= 1; e += 1; }
+-    return uintBitsToFloat(sign | (uint(e) << 23) | (q & 0x7fffffu));
+-}
++/* the GPU's own division (not ge.c's correctly rounded one, a 25-step loop per call) */
++float div_rn(float a, float b) { return a / b; }
+ 
+ /* sqrt(a) rounded to nearest even, for a zero, positive normal or positive subnormal a:
+  * digit-by-digit square root of the significand scaled to 50 bits, giving 24 bits plus a round
+  * bit, and a sticky bit. The root of a subnormal is normal. */
+-float sqrt_rn(float a) {
+-    uint ua = floatBitsToUint(a);
+-    if ((ua & 0x7fffffffu) == 0u) return a;
+-    int ef;
+-    uint m = sig24(ua, ef);
+-    int ee = ef - 150;                               /* a = m * 2^ee */
+-    if ((ee & 1) != 0) { m <<= 1; ee -= 1; } else { m <<= 2; ee -= 2; }   /* m < 2^26 */
+-    uint rem = 0u, root = 0u;
+-    for (int k = 0; k < 25; k++) {                   /* the radicand is m * 2^24 */
+-        int bit = 48 - 2 * k;
+-        uint pair = bit >= 24 ? (m >> uint(bit - 24)) & 3u : 0u;
+-        rem = (rem << 2) | pair;
+-        uint trial = (root << 2) | 1u;
+-        root <<= 1;
+-        if (rem >= trial) { rem -= trial; root |= 1u; }
+-    }
+-    uint round_bit = root & 1u;
+-    uint q = root >> 1;
+-    int er = ee / 2 + 139;
+-    if (round_bit != 0u && (rem != 0u || (q & 1u) != 0u)) q += 1u;
+-    if (q == 0x1000000u) { q >>= 1; er += 1; }
+-    return uintBitsToFloat((uint(er) << 23) | (q & 0x7fffffu));
+-}
++float sqrt_rn(float a) { return sqrt(a); }   /* the GPU's own */
+ 
+ /* ge_powf (ge.c): the specular and powered-diffuse power, in the subset of C and GLSL the two
+  * share. The blocks between the BEGIN and END markers are the same text as in ge.c; these
+@@ -280,110 +299,12 @@ uvec2 ge_pow_mul(uvec2 a, uvec2 b) { return ge_pow_mul_limbs(a, b); }
+  * exact; a six-term series gives log2(1 + a). |y log2 x| is formed in 16.48 fixed point and
+  * split as n + g, and 2^g = 2^(j/64) 2^d with GE_POW_E[j] and a five-term series in d. A NaN
+  * x or y is returned as is, a negative x or y gives NaN, x^0 is 1 and 0^y is +0. */
++/* the GPU's own pow, with ge_powf's edges: x^0 = 1, 0^y = 0, a negative x 0 (the lighting only raises clamped
++ * dot products) */
+ GE_POW_FN float ge_powf(float x, float y) {
+-    uint xb = floatBitsToUint(x);
+-    uint yb = floatBitsToUint(y);
+-    if ((xb & 0x7FFFFFFFu) > 0x7F800000u) return x;
+-    if ((yb & 0x7FFFFFFFu) > 0x7F800000u) return y;
+-    if ((yb & 0x7FFFFFFFu) == 0u) return 1.0f;
+-    if (yb > 0x7FFFFFFFu) return uintBitsToFloat(0x7FC00000u);
+-    if ((xb & 0x7FFFFFFFu) == 0u) return 0.0f;
+-    if (xb > 0x7FFFFFFFu) return uintBitsToFloat(0x7FC00000u);
+-    if (xb == 0x3F800000u) return 1.0f;
+-    if (xb == 0x7F800000u || yb == 0x7F800000u)
+-        return xb > 0x3F800000u ? uintBitsToFloat(0x7F800000u) : 0.0f;
+-    /* x = xm * 2^(xe - 23) and y = ym * 2^(ye - 23), xm and ym in [2^23, 2^24). */
+-    int xe = ge_i((xb >> 23) & 0xFFu);
+-    uint xm = xb & 0x7FFFFFu;
+-    if (xe == 0) { int sh = 23 - findMSB(xm); xm = xm << sh; xe = 1 - sh; }
+-    else xm = xm | 0x800000u;
+-    xe = xe - 127;
+-    int ye = ge_i((yb >> 23) & 0xFFu);
+-    uint ym = yb & 0x7FFFFFu;
+-    if (ye == 0) { int sh = 23 - findMSB(ym); ym = ym << sh; ye = 1 - sh; }
+-    else ym = ym | 0x800000u;
+-    ye = ye - 127;
+-    /* x = m * 2^xe, m as mq in 1.31 fixed point. */
+-    uint mq = xm << 8;
+-    if (xm > 0xB504F3u) { mq = xm << 7; xe = xe + 1; }
+-    uint ix = (mq >> 24) - 90u;
+-    /* a = m R - 1 in 0.64 fixed point. */
+-    uint ph = ge_pow_mulhi(mq, GE_POW_R[ix]);
+-    uint pl = mq * GE_POW_R[ix];
+-    uvec2 a = ge_v2(((ph - 0x40000000u) << 2) | (pl >> 30), pl << 2);
+-    /* log2(1 + a) = a (1/ln 2 - a (1/(2 ln 2) - a (... - a / (6 ln 2)))), coefficients 1.63. */
+-    uvec2 b = ge_pow_sub(ge_v2(0x24EED8A1u, 0xDF37FCF2u), ge_pow_mul(a, ge_v2(0x1EC709DCu, 0x3A03FD75u)));
+-    b = ge_pow_sub(ge_v2(0x2E2A8ECAu, 0x5705FC2Fu), ge_pow_mul(a, b));
+-    b = ge_pow_sub(ge_v2(0x3D8E13B8u, 0x7407FAE9u), ge_pow_mul(a, b));
+-    b = ge_pow_sub(ge_v2(0x5C551D94u, 0xAE0BF85Eu), ge_pow_mul(a, b));
+-    b = ge_pow_sub(ge_v2(0xB8AA3B29u, 0x5C17F0BCu), ge_pow_mul(a, b));
+-    /* log2 m = log2(1 + a) - log2 R, 1.63 two's complement. */
+-    uvec2 l = ge_pow_add(ge_v2(GE_POW_TH[ix], GE_POW_TL[ix]), ge_pow_mul(a, b));
+-    /* |log2 x| = |xe + log2 m| as l * 2^-fb, shifted to its top bit; lneg its sign. */
+-    int fb = 63;
+-    if (xe != 0) {
+-        l = ge_v2((l.x >> 9) | ((l.x & 0x80000000u) != 0u ? 0xFF800000u : 0u), (l.y >> 9) | (l.x << 23));
+-        l.x = l.x + (ge_u(xe) << 22);
+-        fb = 54;
+-    }
+-    uint lneg = l.x >> 31;
+-    if (lneg != 0u) l = ge_pow_sub(ge_v2(0u, 0u), l);
+-    if ((l.x | l.y) == 0u) return 1.0f;
+-    int nz = l.x != 0u ? 31 - findMSB(l.x) : 63 - findMSB(l.y);
+-    if (nz >= 32) l = ge_v2(l.y << (nz - 32), 0u);
+-    else if (nz > 0) l = ge_v2((l.x << nz) | (l.y >> (32 - nz)), l.y << nz);
+-    fb = fb + nz;
+-    /* |y log2 x| = w * 2^(9 + ye - fb), w = ym * l / 2^32, as p in 16.48 fixed point, held at
+-     * 512 once the result is 0 or infinite anyway. */
+-    uvec2 w = ge_pow_mul(ge_v2(ym, 0u), l);
+-    int s = 57 + ye - fb;
+-    uvec2 p = ge_v2(0x02000000u, 0u);
+-    if (s >= 0) {
+-        if (32 + findMSB(w.x) + s < 57)
+-            p = s == 0 ? w : ge_v2((w.x << s) | (w.y >> (32 - s)), w.y << s);
+-    } else if (s > -32) {
+-        p = ge_v2(w.x >> (-s), (w.y >> (-s)) | (w.x << (32 + s)));
+-    } else if (s > -64) {
+-        p = ge_v2(0u, s == -32 ? w.x : w.x >> (-32 - s));
+-    } else {
+-        p = ge_v2(0u, 0u);
+-    }
+-    /* y log2 x = n + g, g in [0, 1) as 0.48 fixed point (g.x holds its top 16 bits). */
+-    int n = ge_i(p.x >> 16);
+-    uvec2 g = ge_v2(p.x & 0xFFFFu, p.y);
+-    if (lneg != 0u) {
+-        n = -n;
+-        if ((g.x | g.y) != 0u) { n = n - 1; g = ge_pow_sub(ge_v2(0x10000u, 0u), g); }
+-    }
+-    if (n >= 128) return uintBitsToFloat(0x7F800000u);
+-    if (n <= -151) return 0.0f;
+-    /* 2^g = 2^(j/64) 2^d, d = g - j/64 in 0.64 fixed point, and
+-     * 2^d - 1 = d (ln 2 + d ((ln 2)^2/2 + d (... + d (ln 2)^5/120))), coefficients 0.64. */
+-    uint j = g.x >> 10;
+-    uvec2 d = ge_v2(((g.x & 0x3FFu) << 16) | (g.y >> 16), g.y << 16);
+-    b = ge_pow_add(ge_v2(0x0276556Du, 0xF749CEE5u), ge_pow_mul(d, ge_v2(0x005761FFu, 0x9E299CC4u)));
+-    b = ge_pow_add(ge_v2(0x0E35846Bu, 0x82505FC6u), ge_pow_mul(d, b));
+-    b = ge_pow_add(ge_v2(0x3D7F7BFFu, 0x058B1D51u), ge_pow_mul(d, b));
+-    b = ge_pow_add(ge_v2(0xB17217F7u, 0xD1CF79ACu), ge_pow_mul(d, b));
+-    b = ge_pow_mul(d, b);
+-    /* 2^(j/64) (1.63) times 1 + b (1.63): r in 2.62 fixed point, in [1, 2). */
+-    uvec2 r = ge_pow_mul(ge_v2(GE_POW_EH[j], GE_POW_EL[j]), ge_v2(0x80000000u | (b.x >> 1), (b.y >> 1) | (b.x << 31)));
+-    /* r * 2^(n - 62) to a float, rounded to nearest even. */
+-    int be = n + 127;
+-    if (be >= 1) {
+-        uint m = r.x >> 7;
+-        uint rem = r.x & 0x7Fu;
+-        if (rem > 0x40u || (rem == 0x40u && (r.y != 0u || (m & 1u) != 0u))) m = m + 1u;
+-        if (m >= 0x1000000u) { m = m >> 1; be = be + 1; }
+-        if (be >= 255) return uintBitsToFloat(0x7F800000u);
+-        return uintBitsToFloat((ge_u(be) << 23) | (m & 0x7FFFFFu));
+-    }
+-    int sh = -119 - n;
+-    uint sm = r.x >> sh;
+-    uint srem = r.x & ((1u << sh) - 1u);
+-    uint hb = 1u << (sh - 1);
+-    if (srem > hb || (srem == hb && (r.y != 0u || (sm & 1u) != 0u))) sm = sm + 1u;
+-    return uintBitsToFloat(sm);
++    if (y == 0.0) return 1.0;
++    if (!(x > 0.0)) return 0.0;
++    return pow(x, y);
+ }
+ /* ---- END ge_powf ---- */
+ 
+@@ -392,46 +313,46 @@ int clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+ 
+ /* ge.c mat43_mul: o = m[0..2] x + m[3..5] y + m[6..8] z + m[9..11], left to right. */
+ vec3 mat43(int at, vec3 p) {
+-    precise float ox = pf(at + 0) * p.x + pf(at + 3) * p.y + pf(at + 6) * p.z + pf(at + 9);
+-    precise float oy = pf(at + 1) * p.x + pf(at + 4) * p.y + pf(at + 7) * p.z + pf(at + 10);
+-    precise float oz = pf(at + 2) * p.x + pf(at + 5) * p.y + pf(at + 8) * p.z + pf(at + 11);
++    float ox = pf(at + 0) * p.x + pf(at + 3) * p.y + pf(at + 6) * p.z + pf(at + 9);
++    float oy = pf(at + 1) * p.x + pf(at + 4) * p.y + pf(at + 7) * p.z + pf(at + 10);
++    float oz = pf(at + 2) * p.x + pf(at + 5) * p.y + pf(at + 8) * p.z + pf(at + 11);
+     return vec3(ox, oy, oz);
+ }
+ 
+ /* ge.c mat33_mul: the upper 3x3 only. */
+ vec3 mat33(int at, vec3 p) {
+-    precise float ox = pf(at + 0) * p.x + pf(at + 3) * p.y + pf(at + 6) * p.z;
+-    precise float oy = pf(at + 1) * p.x + pf(at + 4) * p.y + pf(at + 7) * p.z;
+-    precise float oz = pf(at + 2) * p.x + pf(at + 5) * p.y + pf(at + 8) * p.z;
++    float ox = pf(at + 0) * p.x + pf(at + 3) * p.y + pf(at + 6) * p.z;
++    float oy = pf(at + 1) * p.x + pf(at + 4) * p.y + pf(at + 7) * p.z;
++    float oz = pf(at + 2) * p.x + pf(at + 5) * p.y + pf(at + 8) * p.z;
+     return vec3(ox, oy, oz);
+ }
+ 
+ /* ge.c mat44_mul on (x, y, z, 1). */
+ vec4 mat44(int at, vec3 p) {
+-    precise float ox = pf(at + 0) * p.x + pf(at + 4) * p.y + pf(at + 8)  * p.z + pf(at + 12);
+-    precise float oy = pf(at + 1) * p.x + pf(at + 5) * p.y + pf(at + 9)  * p.z + pf(at + 13);
+-    precise float oz = pf(at + 2) * p.x + pf(at + 6) * p.y + pf(at + 10) * p.z + pf(at + 14);
+-    precise float ow = pf(at + 3) * p.x + pf(at + 7) * p.y + pf(at + 11) * p.z + pf(at + 15);
++    float ox = pf(at + 0) * p.x + pf(at + 4) * p.y + pf(at + 8)  * p.z + pf(at + 12);
++    float oy = pf(at + 1) * p.x + pf(at + 5) * p.y + pf(at + 9)  * p.z + pf(at + 13);
++    float oz = pf(at + 2) * p.x + pf(at + 6) * p.y + pf(at + 10) * p.z + pf(at + 14);
++    float ow = pf(at + 3) * p.x + pf(at + 7) * p.y + pf(at + 11) * p.z + pf(at + 15);
+     return vec4(ox, oy, oz, ow);
+ }
+ 
+ /* ge_gpu.c snap16: floorf(v * 16 + 0.375) / 16. */
+ float snap16(float v) {
+-    precise float s = floor(v * 16.0 + 0.375) * 0.0625;
++    float s = floor(v * 16.0 + 0.375) * 0.0625;
+     return s;
+ }
+ 
+ void main() {
+-    s_base = (in_param + uint(gl_InstanceIndex)) * uint(P_WORDS);
++    decode_vertex();
+     const float k_inv255 = uintBitsToFloat(0x3b808081u);   /* 1.0f / 255.0f */
+ 
+     /* decode_model_vtx: every weight that is not 0, bone by bone. */
+-    precise vec3 pos = in_pos;
+-    precise vec3 nrm = in_nrm;
++    vec3 pos = in_pos;
++    vec3 nrm = in_nrm;
+     int nw = int(pu(P_WEIGHTS));
+     if (nw > 0) {
+         float w[8] = float[8](in_w0.x, in_w0.y, in_w0.z, in_w0.w, in_w1.x, in_w1.y, in_w1.z, in_w1.w);
+-        precise float px = 0.0, py = 0.0, pz = 0.0, nx = 0.0, ny = 0.0, nz = 0.0;
++        float px = 0.0, py = 0.0, pz = 0.0, nx = 0.0, ny = 0.0, nz = 0.0;
+         for (int i = 0; i < nw; i++) {
+             if (w[i] == 0.0) continue;
+             vec3 t = mat43(P_BONE + 12 * i, in_pos);
+@@ -453,25 +374,47 @@ void main() {
+     if (fog_mode == 1u) {
+         fog = pf(P_FOG + 2);
+     } else if (fog_mode == 2u) {
+-        precise float f = (cp.z + pf(P_FOG + 0)) * pf(P_FOG + 1);
++        float f = (cp.z + pf(P_FOG + 0)) * pf(P_FOG + 1);
+         fog = clampf01(f);
+     }
+ 
+-    precise float u = (in_uv.x * pf(P_TEX + 0) + pf(P_TEX + 2)) * pf(P_TEX + 4);
+-    precise float tv = (in_uv.y * pf(P_TEX + 1) + pf(P_TEX + 3)) * pf(P_TEX + 5);
++    float u, tv;
++    uint tmm = pu(P_TEXMAP) & 3u;
++    if (tmm == 1u) {
++        /* projection mapping: the texgen matrix on the model position, the uv, or the (normalized) normal;
++         * no TEXSCALE/TEXOFFSET (ge.c transform_model_vtx_clip) */
++        uint src = (pu(P_TEXMAP) >> 8) & 3u;
++        vec3 sv = src == 0u ? pos : (src == 1u ? vec3(in_uv, 0.0) : nrm);
++        if (src == 2u) { float sl = length(sv); if (sl > 0.0) sv = sv / sl; }
++        vec3 t = mat43(P_TGEN, sv);
++        float q = t.z == 0.0 ? 1.0 : t.z;
++        u = (t.x / q) * pf(P_TEX + 4);
++        tv = (t.y / q) * pf(P_TEX + 5);
++    } else if (tmm == 2u) {
++        /* environment map: (1 + dot(light, world normal)) / 2 for the two lights TEXSHADELS names */
++        vec3 en = mat33(P_WORLD, nrm);
++        float el = length(en);
++        if (el > 0.0) en = en / el;
++        vec3 l0 = vec3(pf(P_ENV + 0), pf(P_ENV + 1), pf(P_ENV + 2)), l1 = vec3(pf(P_ENV + 3), pf(P_ENV + 4), pf(P_ENV + 5));
++        u = (1.0 + dot(l0, en)) * 0.5 * pf(P_TEX + 4);
++        tv = (1.0 + dot(l1, en)) * 0.5 * pf(P_TEX + 5);
++    } else {
++        u = (in_uv.x * pf(P_TEX + 0) + pf(P_TEX + 2)) * pf(P_TEX + 4);
++        tv = (in_uv.y * pf(P_TEX + 1) + pf(P_TEX + 3)) * pf(P_TEX + 5);
++    }
+ 
+     int r = int(in_color.r), g = int(in_color.g), b = int(in_color.b), a = int(in_color.a);
+     if (pu(P_LIGHTING) != 0u) {
+         /* the world-space normal, normalized */
+         vec3 wn = mat33(P_WORLD, nrm);
+-        precise float nl2 = wn.x * wn.x + wn.y * wn.y + wn.z * wn.z;
++        float nl2 = wn.x * wn.x + wn.y * wn.y + wn.z * wn.z;
+         float nl = sqrt_rn(nl2);
+         float wnx = wn.x, wny = wn.y, wnz = wn.z;
+         if (nl > 0.0) { wnx = div_rn(wnx, nl); wny = div_rn(wny, nl); wnz = div_rn(wnz, nl); }
+ 
+         /* light_vertex */
+         uint mupd = pu(P_MATUPD);
+-        precise float vrf = float(r) * k_inv255, vgf = float(g) * k_inv255, vbf = float(b) * k_inv255;
++        float vrf = float(r) * k_inv255, vgf = float(g) * k_inv255, vbf = float(b) * k_inv255;
+         int la = (mupd & 1u) != 0u ? clamp8((a * int(pu(P_AMBALPHA)) + 127) / 255) : int(pu(P_LITALPHA));
+         float mar = pf(P_MATAMB + 0), mag = pf(P_MATAMB + 1), mab = pf(P_MATAMB + 2);
+         float mdr = pf(P_MATDIF + 0), mdg = pf(P_MATDIF + 1), mdb = pf(P_MATDIF + 2);
+@@ -480,70 +423,102 @@ void main() {
+         if ((mupd & 1u) != 0u) { mar = vrf; mag = vgf; mab = vbf; }
+         if ((mupd & 2u) != 0u) { mdr = vrf; mdg = vgf; mdb = vbf; }
+         if ((mupd & 4u) != 0u) { msr = vrf; msg = vgf; msb = vbf; }
+-        precise float lr = pf(P_EMISSIVE + 0) + pf(P_AMB + 0) * mar;
+-        precise float lg = pf(P_EMISSIVE + 1) + pf(P_AMB + 1) * mag;
+-        precise float lb = pf(P_EMISSIVE + 2) + pf(P_AMB + 2) * mab;
++        float lr = pf(P_EMISSIVE + 0) + pf(P_AMB + 0) * mar;
++        float lg = pf(P_EMISSIVE + 1) + pf(P_AMB + 1) * mag;
++        float lb = pf(P_EMISSIVE + 2) + pf(P_AMB + 2) * mab;
+         for (int i = 0; i < 4; i++) {
+             int l = P_LIGHT + L_WORDS * i;
+             if (pu(l + 0) == 0u) continue;
+-            precise float lx = pf(l + 2), ly = pf(l + 3), lz = pf(l + 4);
++            float lx = pf(l + 2), ly = pf(l + 3), lz = pf(l + 4);
+             float att = 1.0;
+             if (pu(l + 1) != 0u) {   /* point or spot: from the vertex, attenuated */
+                 lx = lx - wp.x; ly = ly - wp.y; lz = lz - wp.z;
+-                precise float d2 = lx * lx + ly * ly + lz * lz;
++                float d2 = lx * lx + ly * ly + lz * lz;
+                 float d = sqrt_rn(d2);
+-                precise float den = pf(l + 11) + pf(l + 12) * d + pf(l + 13) * d2;
++                float den = pf(l + 11) + pf(l + 12) * d + pf(l + 13) * d2;
+                 att = den > 0.0 ? clampf01(div_rn(1.0, den)) : 1.0;
+                 if (d > 0.0) { lx = div_rn(lx, d); ly = div_rn(ly, d); lz = div_rn(lz, d); }
+             }
+             uint comp = pu(l + 14);
+-            precise float ndl = wnx * lx + wny * ly + wnz * lz;
++            float ndl = wnx * lx + wny * ly + wnz * lz;
+             if (ndl < 0.0) ndl = 0.0;
+             if (comp == 2u && spec > 0.0) ndl = ge_powf(ndl, spec);   /* powered diffuse */
+-            precise float addr = att * (pf(l + 5) * mar + pf(l + 8) * mdr * ndl);
+-            precise float addg = att * (pf(l + 6) * mag + pf(l + 9) * mdg * ndl);
+-            precise float addb = att * (pf(l + 7) * mab + pf(l + 10) * mdb * ndl);
++            float addr = att * (pf(l + 5) * mar + pf(l + 8) * mdr * ndl);
++            float addg = att * (pf(l + 6) * mag + pf(l + 9) * mdg * ndl);
++            float addb = att * (pf(l + 7) * mab + pf(l + 10) * mdb * ndl);
+             lr = lr + addr; lg = lg + addg; lb = lb + addb;
+             if ((comp & 1u) != 0u && ndl > 0.0) {   /* specular, Blinn half-vector with eye (0,0,1) */
+-                precise float hx = lx, hy = ly, hz = lz + 1.0;
+-                precise float hd2 = hx * hx + hy * hy + hz * hz;
++                float hx = lx, hy = ly, hz = lz + 1.0;
++                float hd2 = hx * hx + hy * hy + hz * hz;
+                 float hd = sqrt_rn(hd2);
+                 if (hd > 0.0) {
+-                    precise float nh = wnx * hx + wny * hy + wnz * hz;
++                    float nh = wnx * hx + wny * hy + wnz * hz;
+                     float ndh = div_rn(nh, hd);
+                     if (ndh > 0.0) {
+                         float sp = spec > 0.0 ? ge_powf(ndh, spec) : ndh;
+-                        precise float spr = att * pf(l + 15) * msr * sp;
+-                        precise float spg = att * pf(l + 16) * msg * sp;
+-                        precise float spb = att * pf(l + 17) * msb * sp;
++                        float spr = att * pf(l + 15) * msr * sp;
++                        float spg = att * pf(l + 16) * msg * sp;
++                        float spb = att * pf(l + 17) * msb * sp;
+                         lr = lr + spr; lg = lg + spg; lb = lb + spb;
+                     }
+                 }
+             }
+         }
+-        precise float sr = lr * 255.0 + 0.5, sg = lg * 255.0 + 0.5, sb = lb * 255.0 + 0.5;
++        float sr = lr * 255.0 + 0.5, sg = lg * 255.0 + 0.5, sb = lb * 255.0 + 0.5;
+         r = clamp8(int(sr)); g = clamp8(int(sg)); b = clamp8(int(sb)); a = clamp8(la);
+     }
+ 
+-    /* project_cvtx */
+-    float inv_w = div_rn(1.0, clip.w);
+-    precise float ndcx = clip.x * inv_w, ndcy = clip.y * inv_w, ndcz = clip.z * inv_w;
+-    precise float sx = ndcx * pf(P_VP + 0) + pf(P_VP + 3) - pf(P_OFF + 0);
+-    precise float sy = ndcy * pf(P_VP + 1) + pf(P_VP + 4) - pf(P_OFF + 1);
+-    precise float szr = ndcz * pf(P_VP + 2) + pf(P_VP + 5);
+-    float sz = szr < 0.0 ? 0.0 : szr > 65535.0 ? 65535.0 : szr;
+-    precise float uw = u * inv_w, vw = tv * inv_w;
+-
+-    /* put_vert, then psp.vert */
+-    float x = snap16(sx), y = snap16(sy);
+-    gl_Position = vec4(x * (1.0 / 256.0) - 1.0,
+-                       y * (1.0 / 136.0) - 1.0,
+-                       sz * (1.0 / 65535.0),
+-                       1.0);
+-    v_uv    = vec2(uw, vw);
+-    v_rw    = inv_w;
++    /* True clip coordinates: the GPU clips a PRIM at the PSP's near and far planes
++     * (Vulkan's z = 0 and z = w are the viewport's two depth ends) and divides; ge.c keeps only the PSP's triangle drops (guard
++     * band, depth range). A vertex in front keeps the PSP's 1/16-pixel snap (applied before the divide is undone); one behind
++     * the eye is its projective point as it is. u, v interpolate with perspective (v_rw = 1). */
++    float W = clip.w;
++    float vxs = pf(P_VP + 0), vys = pf(P_VP + 1), vzs = pf(P_VP + 2), vxc = pf(P_VP + 3), vyc = pf(P_VP + 4), vzc = pf(P_VP + 5);
++    float ox = pf(P_OFF + 0), oy = pf(P_OFF + 1);
++    vec4 cpos;
++    if (W > 0.0) {
++        float inv_w = div_rn(1.0, W);
++        float sx = clip.x * inv_w * vxs + vxc - ox;
++        float sy = clip.y * inv_w * vys + vyc - oy;
++        float szr = clip.z * inv_w * vzs + vzc;
++        float x = snap16(sx), y = snap16(sy);
++        cpos = vec4((x * (1.0 / 256.0) - 1.0) * W, ((y + k_vpad) * k_yscale - 1.0) * W, szr * (1.0 / 65535.0) * W, W);
++    } else {
++        cpos = vec4((clip.x * vxs + (vxc - ox) * W) * (1.0 / 256.0) - W, (clip.y * vys + (vyc - oy + k_vpad) * W) * k_yscale - W,
++                   (clip.z * vzs + vzc * W) * (1.0 / 65535.0), W);
++    }
++    /* The PSP's triangle drops, vertex by vertex, as PPSSPP's hardware T&L decides them:
++     * a vertex the PSP leaves out takes a NaN position (P_NAN, read at run time) and the GPU drops every triangle it is in. ge.c's
++     * tnl_vertex_flags, the same formulas in the same order: non-finite; past the guard band (in front of the near plane when the
++     * depth clips); outside the depth range when it does not clip; at the eye plane (w <= 1e-3) and not behind it. A triangle
++     * wholly behind the eye, beyond the depth range or at w < 0 (the PSP's all-vertex rules) the GPU clips away. */
++    {
++        precise float cx = clip.x, cy = clip.y, cz = clip.z, cw = clip.w;
++        bool drop = isnan(cx) || isinf(cx) || isnan(cy) || isinf(cy) || isnan(cz) || isinf(cz) || isnan(cw) || isinf(cw);
++        if (!drop) {
++            precise float iw = div_rn(1.0, cw);
++            precise float zw = cz * iw;
++            bool zout = zw >= 1.000030517578125 || -zw >= 1.000030517578125;
++            precise float sx = cx * vxs * iw + vxc;
++            precise float sy = cy * vys * iw + vyc;
++            precise float sz = cz * vzs * iw + vzc;
++            const float SB = 4095.96875;   /* 4095 + 15.5 / 16 */
++            if (isnan(sx) || isinf(sx) || isnan(sy) || isinf(sy) || isnan(sz) || isinf(sz)) drop = true;
++            else if ((pu(P_CULL) & 1u) != 0u) {
++                if (cz > -cw && (sx >= SB || sy >= SB || sx < 0.0 || sy < 0.0)) drop = true;
++            } else if (sx > SB || sy >= SB || sx < 0.0 || sy < 0.0 || sz < 0.0 || sz >= 65536.0 || zout) {
++                drop = true;
++            }
++            if (!(cw > 1e-3) && !(cz + cw < 0.0)) drop = true;
++        }
++        if (drop) cpos = vec4(pf(P_NAN));
++    }
++    gl_Position = cpos;
++    v_uv    = vec2(u, tv);
++    v_rw    = 1.0;
+     v_fog   = fog;
+     v_color = vec4(div_rn(float(clamp8(r)), 255.0), div_rn(float(clamp8(g)), 255.0),
+                    div_rn(float(clamp8(b)), 255.0), div_rn(float(clamp8(a)), 255.0));
++    v_color_flat = v_color;
+     v_uvbox = vec4(1.0, 1.0, 0.0, 0.0);   /* transform mode: no edge clamp (psp.vert) */
+ }

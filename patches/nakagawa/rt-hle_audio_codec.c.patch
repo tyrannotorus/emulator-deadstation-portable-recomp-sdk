@@ -1,0 +1,296 @@
+diff --git a/src/rt/hle_audio_codec.c b/src/rt/hle_audio_codec.c
+index 5b73f0cb..bbc34318 100644
+--- a/src/rt/hle_audio_codec.c
++++ b/src/rt/hle_audio_codec.c
+@@ -54,6 +54,11 @@
+ #define ATRAC_STATE_STREAMED_LOOP_TRAILER 6
+ #define ATRAC_RIFF_SCAN_MAX 0x00100000u
+ Atrac s_atrac[8];
++#ifdef SR_GE_NATIVE
++static void atrac_async_settle(void);   /* below */
++#else
++static inline void atrac_async_settle(void) {}
++#endif
+ static int atrac_streamed_state(const Atrac *a);
+ static uint32_t atrac_stream_buffer_end(const Atrac *a);
+ static uint32_t atrac_remaining_frames(const Atrac *a);
+@@ -504,6 +509,7 @@ static void audio_note_atrac_out(uint32_t buf) {
+ /* Decoder lifecycle. Plain ATRAC3 (0x1001) and ATRAC3+ (0x1000) have separate
+  * FFmpeg n4.4 instances and separate format/frame contracts. */
+ void atrac_release_decoder(Atrac *a) {
++    atrac_async_settle();
+     atrac3p_bridge_destroy(a->dec);
+     a->dec = NULL;
+     atrac3_bridge_destroy(a->dec_at3);
+@@ -519,6 +525,7 @@ void atrac_release_decoder(Atrac *a) {
+     a->host_pcm = NULL;
+ }
+ static int atrac_reset_decoder(Atrac *a) {
++    atrac_async_settle();
+     int ret = 0;
+     if (a->dec)
+         ret = atrac3p_bridge_reset(a->dec);
+@@ -529,6 +536,7 @@ static int atrac_reset_decoder(Atrac *a) {
+     return ret;
+ }
+ static void atrac_ensure_decoder(Atrac *a) {
++    atrac_async_settle();
+     if (a->dec || a->dec_at3) {
+         /* A reused slot (h_AtracSetData on an existing id) may carry a decoder
+          * created for a previous track config; recreate when the RIFF changed. */
+@@ -595,6 +603,7 @@ static int atrac_log_on(void) {
+ int s_atrac_caps_configured;
+ uint32_t s_atrac_slot_codec[8];   /* 0 = reserved for no codec */
+ static int atrac_alloc_slot(uint32_t codec) {
++    atrac_async_settle();
+     for (int i = 0; i < 8; i++) {
+         if (s_atrac[i].used) continue;
+         if (s_atrac_caps_configured && s_atrac_slot_codec[i] != codec) continue;
+@@ -699,7 +708,10 @@ static uint32_t atrac_set_new(uint32_t buf, uint32_t readSize, uint32_t bufSize,
+     atrac_log_setdata(a, call);
+     return (uint32_t)id;
+ }
+-static Atrac *atrac_of(uint32_t id) { return id < 8 && s_atrac[id].used ? &s_atrac[id] : 0; }
++static Atrac *atrac_of(uint32_t id) {
++    atrac_async_settle();
++    return id < 8 && s_atrac[id].used ? &s_atrac[id] : 0;
++}
+ /* Shared body of the calls that configure an existing ID. A MOut call on a
+  * track that is not mono returns NOT_MONO; the public reference keeps the
+  * data in that case, but its stereo-to-mono output is not modelled here, so
+@@ -878,6 +890,81 @@ unsigned sr_hle_test_atrac_prime_decodes(int reset) {
+     return n;
+ }
+ #endif
++#ifdef SR_GE_NATIVE
++/* An ATRAC3+ frame decoded on a core of its own. sceAtracDecodeData keeps its caller waiting for the
++ * PSP's decode time (the measured block, above) while the other threads run: the frame's bytes are taken on the game's thread, a
++ * helper decodes them meanwhile, and the caller, resumed, writes the PCM (and returns the error a failed frame gives).
++ * Any other ATRAC call first waits for the helper and writes a finished frame's PCM (atrac_async_settle), so the decoder, its
++ * buffers and the guest's output are never in two hands. One frame at a time. */
++#include <pthread.h>
++static pthread_mutex_t s_ad_m = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t s_ad_c = PTHREAD_COND_INITIALIZER;
++static int s_ad_thread_ok = -1;           /* the helper: -1 not started, 1 running, 0 none (decodes stay on the caller) */
++static int s_ad_busy, s_ad_done;          /* a frame given to the helper; its decode over */
++static Atrac *s_ad_a;                     /* the frame's track, its output and leading samples dropped */
++static uint32_t s_ad_out;
++static int s_ad_skip, s_ad_ret, s_ad_n;
++static int s_ad_result[8];                /* per track: the last frame's outcome (1 written, -1 failed) for its caller */
++void brick_affinity(int core) __attribute__((weak));
++static void *atrac_async_main(void *arg) {
++    (void)arg;
++    if (brick_affinity) brick_affinity(0);   /* with the other helpers, off the game's core */
++    pthread_mutex_lock(&s_ad_m);
++    for (;;) {
++        while (!s_ad_busy || s_ad_done) pthread_cond_wait(&s_ad_c, &s_ad_m);
++        Atrac *a = s_ad_a;
++        pthread_mutex_unlock(&s_ad_m);
++        int n = 0;
++        const int ret = atrac3p_bridge_decode(a->dec, a->host_frame, (int)a->bytesPerFrame, a->host_pcm, &n);
++        pthread_mutex_lock(&s_ad_m);
++        s_ad_ret = ret;
++        s_ad_n = n;
++        s_ad_done = 1;
++        pthread_cond_broadcast(&s_ad_c);
++    }
++    return NULL;
++}
++static void atrac_write_pcm(Atrac *a, uint32_t out, int skip, int n);
++/* the helper's frame, if any: waited for and its PCM written to the caller's output (game thread) */
++static void atrac_async_settle(void) {
++    if (!s_ad_busy) return;
++    pthread_mutex_lock(&s_ad_m);
++    while (!s_ad_done) pthread_cond_wait(&s_ad_c, &s_ad_m);
++    pthread_mutex_unlock(&s_ad_m);
++    Atrac *a = s_ad_a;
++    const int id = (int)(a - s_atrac);
++    if (s_ad_ret < 0 || s_ad_n != atrac_samples_per_frame(a)) {
++        fprintf(stderr, "ATRAC_DECODE: frame decode failed ret=%d n=%d (decoded beside the caller's wait)\n", s_ad_ret, s_ad_n);
++        s_ad_result[id] = -1;
++    } else {
++        atrac_write_pcm(a, s_ad_out, s_ad_skip, s_ad_n);
++        s_ad_result[id] = 1;
++    }
++    s_ad_busy = 0;
++}
++/* the frame in a->host_frame to the helper (atrac_async_settle before) */
++static void atrac_async_start(Atrac *a, uint32_t out, int skip) {
++    pthread_mutex_lock(&s_ad_m);
++    s_ad_a = a;
++    s_ad_out = out;
++    s_ad_skip = skip;
++    s_ad_done = 0;
++    s_ad_busy = 1;
++    s_ad_result[a - s_atrac] = 0;
++    pthread_cond_broadcast(&s_ad_c);
++    pthread_mutex_unlock(&s_ad_m);
++}
++static int atrac_async_ok(void) {
++    if (s_ad_thread_ok < 0) {
++        pthread_t t;
++        s_ad_thread_ok = pthread_create(&t, NULL, atrac_async_main, NULL) == 0;
++        if (s_ad_thread_ok) pthread_detach(t);
++        else fprintf(stderr, "ATRAC: no decode thread: frames decode on the caller's thread\n");
++    }
++    return s_ad_thread_ok;
++}
++#endif
++
+ static int atrac_decode_frame(Atrac *a, uint32_t out, int skip, int *samples_out) {
+     uint32_t src;
+     int streamed = atrac_streamed_state(a);
+@@ -938,9 +1025,17 @@ static int atrac_decode_frame(Atrac *a, uint32_t out, int skip, int *samples_out
+      * hardening): the complete channels*kept*2 writable span must be valid, and
+      * a rejected output address must not leave partial PCM behind. */
+     int kept = n - skip;
+-    const int16_t *pcm = a->host_pcm + skip * a->channels;
+     if (out && !sr_guest_span_writable(out, (uint32_t)kept * (uint32_t)a->channels * 2u))
+         return -1;
++    atrac_write_pcm(a, out, skip, n);
++    if (samples_out) *samples_out = n;
++    return 1;
++}
++
++/* host_pcm's frame (n samples, the first `skip` dropped) to the guest's output, the span checked before */
++static void atrac_write_pcm(Atrac *a, uint32_t out, int skip, int n) {
++    int kept = n - skip;
++    const int16_t *pcm = a->host_pcm + skip * a->channels;
+     /* host_pcm is already interleaved channels*n s16 (PR-A contract). */
+     if (out)
+         for (int i = 0; i < kept * a->channels; i++)
+@@ -957,9 +1052,44 @@ static int atrac_decode_frame(Atrac *a, uint32_t out, int skip, int *samples_out
+         if (pk > g_atrac_peak) g_atrac_peak = pk;
+         audio_note_atrac_out(out);
+     }
+-    if (samples_out) *samples_out = n;
++}
++
++#ifdef SR_GE_NATIVE
++/* atrac_decode_frame's first half for the helper: the frame's bytes into host_frame and the output's span checked,
++ * then the decode given away. 1 started, 0 no frame yet, -1 refused (as atrac_decode_frame's) */
++static int atrac_decode_frame_async(Atrac *a, uint32_t out, int skip) {
++    uint32_t src;
++    const int streamed = atrac_streamed_state(a);
++    if (skip < 0 || skip >= atrac_samples_per_frame(a)) return -1;
++    if (a->bytesPerFrame == 0u) return 0;
++    if (streamed) {
++        if (a->bufferValidBytes < a->bytesPerFrame) return 0;
++        if (!a->streamWindow || a->streamWindowQueued < a->bytesPerFrame)
++            return -1;
++        src = a->buf + a->bufferPos;
++    } else {
++        uint32_t off = atrac_file_offset_by_sample(a, a->posSample);
++        if (a->size < a->bytesPerFrame || off > a->size - a->bytesPerFrame)
++            return 0;
++        src = a->buf + off;
++    }
++    if (!a->dec || !a->host_frame || !a->host_pcm) return -1;
++    if (a->bytesPerFrame > (uint32_t)a->host_frame_cap) return -1;
++    const int kept = atrac_samples_per_frame(a) - skip;
++    if (out && !sr_guest_span_writable(out, (uint32_t)kept * (uint32_t)a->channels * 2u))
++        return -1;
++    if (streamed) {
++        if (!atrac_stream_window_peek(a, a->host_frame, a->bytesPerFrame))
++            return -1;
++    } else {
++        if (!sr_guest_span_readable(src, a->bytesPerFrame)) return -1;
++        for (uint32_t i = 0u; i < a->bytesPerFrame; i++)
++            a->host_frame[i] = (uint8_t)MEM_R8(src + i);
++    }
++    atrac_async_start(a, out, skip);
+     return 1;
+ }
++#endif
+ 
+ /* First sceAtracDecodeData of a plain AT3 track against the delay word d of an 8-byte RIFF fact
+  * chunk.  MEASURED on a PSP-3000 (firmware 6.61; #1096, PSP-AT3-002 at3-delay-sweep, 2026-10-31,
+@@ -1040,7 +1170,18 @@ static uint32_t h_AtracDecodeData(CpuState *s) {
+         return first_err;
+     }
+     int decoded_samples = 0;
++#ifdef SR_GE_NATIVE
++    /* an ATRAC3+ frame with a measured decode time: decoded beside the caller's wait */
++    const int async = a->codecType != ATRAC_CODEC_AT3 && atrac_measured_decode_block_us(a) && atrac_async_ok();
++    int st;
++    if (async) {
++        st = atrac_decode_frame_async(a, out, skip);
++        if (st > 0) decoded_samples = atrac_samples_per_frame(a);
++    } else
++        st = atrac_decode_frame(a, out, skip, &decoded_samples);
++#else
+     int st = atrac_decode_frame(a, out, skip, &decoded_samples);
++#endif
+     if (st < 0) {
+         /* Honest gap: this track cannot produce PCM in this build (unsupported
+          * codec, decoder allocation failure, or a frame that failed to decode).
+@@ -1073,12 +1214,18 @@ static uint32_t h_AtracDecodeData(CpuState *s) {
+         a->at3FirstFramePending = 0;
+         if (atrac_streamed_state(a)) atrac_consume_frame(a);
+         a->posSample += decoded_samples;
+-        if (atrac_streamed_state(a) && a->loopEndSample > 0 && a->posSample > a->loopEndSample) {
++        /* rewound at the loop end only while loops remain (PPSSPP: loopNum != 0); with none left (a sound played once:
++         * sceAtracSetLoopNum 0) it plays on to the end and finishes */
++        if (atrac_streamed_state(a) && a->loopEndSample > 0 && a->posSample > a->loopEndSample && a->loopNum != 0) {
+             a->posSample = a->loopStartSample >= 0 ? a->loopStartSample : 0;
+             if (a->loopNum > 0) a->loopNum--;
+             (void)atrac_reset_decoder(a);   /* loop rewind: no cross-frame leak */
+         } else if (a->posSample >= a->endSample) {
+-            if (a->loopNum == 0) finished = 1;
++            if (a->loopNum == 0 || a->loopEndSample <= 0) {   /* no loop points: once */
++                finished = 1;
++                static int said;   /* a track that ends, in the log */
++                if (said < 64) { said++; fprintf(stderr, "atrac: a track played to its end (%d samples)\n", (int)a->endSample); }
++            }
+             else {
+                 a->posSample = a->loopStartSample >= 0 ? a->loopStartSample : 0;
+                 if (a->loopNum > 0) a->loopNum--;
+@@ -1104,6 +1251,19 @@ static uint32_t h_AtracDecodeData(CpuState *s) {
+     const uint32_t block_us = st > 0 ? atrac_measured_decode_block_us(a) : 0u;
+     s_atrac_last_block_us = block_us;
+     if (block_us) sched_delay_current(block_us);
++#ifdef SR_GE_NATIVE
++    if (async && st > 0) {   /* resumed: the frame's PCM written (here, or by a call made meanwhile) */
++        const int id = (int)(a - s_atrac);
++        atrac_async_settle();
++        if (s_ad_result[id] < 0) {   /* as a frame that fails before the wait: no samples, finished, the error */
++            if (decAddr) MEM_W32(decAddr, 0u);
++            if (finAddr) MEM_W32(finAddr, 1u);
++            if (remAddr) MEM_W32(remAddr, 0u);
++            atrac_report_decode_failure(a);
++            return ATRAC_ERROR_UNKNOWN_FORMAT;
++        }
++    }
++#endif
+     return 0;
+ }
+ /* sceAtracGetNextSample(id, *outN): how many samples the NEXT DecodeData call
+@@ -1299,7 +1459,19 @@ static uint32_t h_AtracGetLoopStatus(CpuState *s) {
+     if (A2) MEM_W32(A2, a->loopEndSample > 0 && a->bufferState != ATRAC_STATE_STREAMED_LOOP_TRAILER ? 1u : 0u);
+     return 0;
+ }
+-static uint32_t h_AtracSetLoopNum(CpuState *s) { Atrac *a = atrac_of(A0); if (a) a->loopNum = (int)A1; return 0; }
++/* A track without loop points (no smpl chunk) refuses a loop count and keeps playing once, as the PSP does (PPSSPP
++ * sceAtracSetLoopNum: ATRAC_ERROR_NO_LOOP_INFORMATION, very common with -1). */
++static uint32_t h_AtracSetLoopNum(CpuState *s) {
++    Atrac *a = atrac_of(A0);
++    if (!a) return ATRAC_ERROR_BAD_ATRACID;
++    if (a->loopEndSample <= 0) {   /* ATRAC_ERROR_NO_LOOP_INFORMATION */
++        static int said;
++        if (said < 64) { said++; fprintf(stderr, "atrac %u: no loop points, a loop count of %d refused: plays once\n", A0, (int)A1); }
++        return 0x80630021u;
++    }
++    a->loopNum = (int)A1;
++    return 0;
++}
+ /* sceAtracGetBufferInfoForResetting and sceAtracResetPlayPosition share one
+  * description of the refill that a reset to `sample` needs: one span of the
+  * 32-byte PSPSDK pspatrac3.h PspBufferInfo (write address, bytes the guest
+@@ -1467,6 +1639,7 @@ static uint32_t h_AtracGetBufferInfoForResetting(CpuState *s) {
+ #define ATRAC_REINIT_BUDGET 6
+ static uint32_t s_atrac_reinit_count = 0u;
+ static uint32_t h_AtracReinit(CpuState *s) {
++    atrac_async_settle();
+     int at3 = (int)A0, at3plus = (int)A1;
+     for (int i = 0; i < 8; i++) {
+         if (s_atrac[i].used) return 0x80000021u; /* SCE_KERNEL_ERROR_BUSY */

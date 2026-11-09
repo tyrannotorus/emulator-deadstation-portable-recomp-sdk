@@ -1,0 +1,23 @@
+diff --git a/src/rt/hle_utility.c b/src/rt/hle_utility.c
+index c4c53af9..bf6daaf8 100644
+--- a/src/rt/hle_utility.c
++++ b/src/rt/hle_utility.c
+@@ -555,6 +555,18 @@ static uint32_t utility_dialog_update(UtilityDialog *d) {
+          * answer into options left buttonPressed 0, which a yes/no caller reads as "no". */
+         else if (kind == UTILITY_MSG && MEM_R32(param) >= 0x244u)
+             MEM_W32(param + 0x240, msg_dialog_default_answer(param));
++#ifdef SR_GE_NATIVE
++        /* the network dialog: a recomp module has no network to join (ad hoc: nobody nearby), so
++         * the dialog ends as a PSP alone's does when the player backs out of it: cancelled (1), not finished-OK (0), after which a
++         * game waits for a group that never forms */
++        else if (kind == UTILITY_NETCONF) {
++            fprintf(stderr, "sceUtilityNetconf: no network in a recomp module (action %u): the dialog ends cancelled\n",
++                    MEM_R32(param) >= 0x34u ? MEM_R32(param + 0x30) : 0u);
++            result = 1u;
++            void sr_adhocctl_dialog_cancelled(void);
++            sr_adhocctl_dialog_cancelled();
++        }
++#endif
+         dialog_lock();
+         if (generation == d->generation) {
+             d->result = result;

@@ -1,0 +1,89 @@
+diff --git a/src/rt/fp_convert.h b/src/rt/fp_convert.h
+index 99bdb084..401d46de 100644
+--- a/src/rt/fp_convert.h
++++ b/src/rt/fp_convert.h
+@@ -39,6 +39,9 @@
+ #include <math.h>
+ #include <stdint.h>
+ #include <string.h>
++#if defined(SR_FPU_NATIVE) && defined(__aarch64__)
++#include <arm_neon.h>
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -126,6 +129,34 @@ static inline double sr_finite_float_to_double(uint32_t bits) {
+     return (bits >> 31) != 0u ? -magnitude : magnitude;
+ }
+ 
++#if defined(SR_FPU_NATIVE) && defined(__aarch64__)
++/* The PSP's float-to-word conversions are AArch64's own: fcvtns/fcvtzs/fcvtps/fcvtms
++ * round as round.w/trunc.w/ceil.w/floor.w do and saturate as the PSP does (an infinity to INT32_MAX or INT32_MIN); only a NaN
++ * differs (0 on the host, INT32_MAX on the PSP), chosen first. One instruction, not a software decode through ldexp. */
++static inline uint32_t sr_native_to_word(float x, unsigned mode) {
++    if (x != x) return 0x7fffffffu;
++    switch (mode & 3u) {
++        case SR_FP_ROUND_TO_ZERO:  return (uint32_t)vcvts_s32_f32(x);
++        case SR_FP_ROUND_POSITIVE: return (uint32_t)vcvtps_s32_f32(x);
++        case SR_FP_ROUND_NEGATIVE: return (uint32_t)vcvtms_s32_f32(x);
++        default:                   return (uint32_t)vcvtns_s32_f32(x);
++    }
++}
++static inline uint32_t sr_fpu_to_word(float x, uint32_t funct, uint32_t fcr31) {
++    switch (funct) {
++        case 0x0cu: return sr_native_to_word(x, SR_FP_ROUND_NEAREST_EVEN);
++        case 0x0du: return sr_native_to_word(x, SR_FP_ROUND_TO_ZERO);
++        case 0x0eu: return sr_native_to_word(x, SR_FP_ROUND_POSITIVE);
++        case 0x0fu: return sr_native_to_word(x, SR_FP_ROUND_NEGATIVE);
++        case 0x24u: return sr_native_to_word(x, fcr31 & 3u);
++        default:    return sr_native_to_word(x, SR_FP_ROUND_NEAREST_EVEN);
++    }
++}
++/* the scale is a power of two: exact in float up to an overflow, which saturates as the PSP's does */
++static inline uint32_t sr_vfpu_to_word(float x, unsigned mode, unsigned scale) {
++    return sr_native_to_word(x * (float)(1u << (scale & 31u)), mode);
++}
++#else
+ /* funct is the COP1 S-format function field. cvt.w.s uses fcr31[1:0]. */
+ static inline uint32_t sr_fpu_to_word(float x, uint32_t funct, uint32_t fcr31) {
+     const uint32_t bits = sr_float_bits(x);
+@@ -154,6 +185,7 @@ static inline uint32_t sr_vfpu_to_word(float x, unsigned mode, unsigned scale) {
+         ldexp(sr_finite_float_to_double(bits), (int)(scale & 31u)), mode
+     );
+ }
++#endif  /* SR_FPU_NATIVE && __aarch64__ */
+ 
+ /* Interpret a PSP word as signed without an implementation-defined
+  * uint32_t-to-int32_t conversion or assuming the host's signed representation. */
+@@ -377,6 +409,22 @@ static inline float sr_fpu_soft_ftz_div(float a, float b, float r) {
+  * matrix, restoration checks); Clang/MSVC are NOT exercised and fail closed
+  * at the gates above. */
+ 
++#ifdef SR_FPU_NATIVE
++/* With FCR31 at 0 (round to nearest, no flush), the host's own mode, each operation is the plain one, with no rounding-mode window
++ * around it (the exact helpers save, set and restore the FP control register for every operation). */
++static inline float sr_fpu_add_s(float a, float b, uint32_t fcr31) { (void)fcr31; return a + b; }
++static inline float sr_fpu_sub_s(float a, float b, uint32_t fcr31) { (void)fcr31; return a - b; }
++static inline float sr_fpu_mul_s(float a, float b, uint32_t fcr31) { (void)fcr31; return a * b; }
++static inline float sr_fpu_div_s(float a, float b, uint32_t fcr31) { (void)fcr31; return a / b; }
++static inline float sr_fpu_cvt_s_w(int32_t value, uint32_t fcr31) { (void)fcr31; return (float)value; }
++static inline unsigned sr_fpu_condition_s(unsigned condition, uint32_t a_bits, uint32_t b_bits) {
++    float a, b;
++    memcpy(&a, &a_bits, sizeof a);
++    memcpy(&b, &b_bits, sizeof b);
++    const unsigned unordered = a != a || b != b;
++    return (unordered && (condition & 1u)) || (a == b && (condition & 2u)) || (a < b && (condition & 4u));
++}
++#else
+ static inline float sr_fpu_add_s(float a, float b, uint32_t fcr31) {
+     volatile float va = a;
+     volatile float vb = b;
+@@ -488,6 +536,8 @@ static inline unsigned sr_fpu_condition_s(unsigned condition, uint32_t a_bits,
+            (less && (condition & 4u));
+ }
+ 
++#endif  /* SR_FPU_NATIVE */
++
+ #ifdef __cplusplus
+ }  /* extern "C" */
+ #endif

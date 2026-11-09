@@ -1,0 +1,181 @@
+diff --git a/src/rt/hle_ge.c b/src/rt/hle_ge.c
+index 16480f22..522381ff 100644
+--- a/src/rt/hle_ge.c
++++ b/src/rt/hle_ge.c
+@@ -231,10 +231,68 @@ static void ge_timing_charge_run(void) {
+ /* The GE ran the list in `slot` to its END.  By default it completes now and its finish
+  * callback runs in this call, as it always has; with the model on it draws until the GE
+  * timeline reaches the end of its work. */
++/* the lists run on the GE worker's thread (runtime/ge_worker.c), beside the game: a run
++ * is posted and its end taken at the game's next GE or display call (ge_async_poll), where the finish callback then runs. A list in
++ * flight keeps its STALLED status (it holds the queue, as the GE's current list) and reads as drawing to a sync peek. */
++int  ge_worker_on(void);
++void ge_worker_run(int slot, uint32_t pc, int resume, uint32_t stall, uint32_t stacks);
++int  ge_worker_take(int *slot, uint32_t *next_pc, uint32_t *finish_id, uint32_t *stall);
++int  ge_worker_inflight(int slot);
++void ge_worker_wait(void);
++void ge_worker_drain(void);
++static int s_async_fid_set;
++static uint32_t s_async_fid;
++static void ge_list_reached_end(CpuState *s, int slot);
++static int ge_list_run(int slot, uint32_t pc, int resume, uint32_t *next_pc);
++static void ge_queue_run(CpuState *s);
++
++/* the worker's finished runs: an END completes the list (its finish callback) and starts the next queued; a stall keeps it, run on
++ * at once when the game moved the stall address meanwhile */
++void ge_async_poll(CpuState *s) {
++    if (!ge_worker_on()) return;
++    int slot;
++    uint32_t next, fid, stall;
++    while (ge_worker_take(&slot, &next, &fid, &stall)) {
++        if (slot < 0 || slot >= GE_LIST_MAX) continue;
++        GeListInfo *l = &s_ge_lists[slot];
++        if (next == 0u) {
++            s_async_fid = fid;
++            s_async_fid_set = 1;
++            ge_list_reached_end(s, slot);
++            s_async_fid_set = 0;
++            ge_queue_run(s);
++        } else {
++            l->current_pc = next;
++            if (l->stall_addr != stall && l->status == GE_LIST_STALLED && !ge_worker_inflight(slot)) {
++                uint32_t unused;
++                (void)ge_list_run(slot, next, 1, &unused);
++            }
++        }
++    }
++}
++
++/* wait for the worker's runs of `slot` (< 0: all) to end, letting the game's other threads run meanwhile */
++static void ge_async_wait(CpuState *s, int slot) {
++    ge_async_poll(s);
++    while (ge_worker_inflight(slot)) {
++        if (sched_current_uid() != 0u) sched_delay_current(300u);
++        else ge_worker_wait();
++        ge_async_poll(s);
++    }
++}
++
++/* before a call that reads or changes the GE's state: everything posted done */
++static void ge_async_settle(CpuState *s) {
++    if (!ge_worker_on()) return;
++    ge_async_wait(s, -1);
++    ge_worker_drain();
++    ge_async_poll(s);
++}
++
+ static void ge_list_reached_end(CpuState *s, int slot) {
+     GeListInfo *l = &s_ge_lists[slot];
+     l->executed = 1;
+-    l->finish_id = ge_last_finish_id();
++    l->finish_id = s_async_fid_set ? s_async_fid : ge_last_finish_id();
+     if (ge_timing_on()) {
+         l->status = GE_LIST_DRAWING;
+         l->done_us = (s_ge_busy_until_ns + 999u) / 1000u;
+@@ -272,6 +330,7 @@ static void ge_timing_wait(int slot) {
+ }
+ 
+ static uint32_t h_GeGetCmd(CpuState *s) {
++    ge_async_settle(s);
+     (void)s;
+     if (A0 > 0xffu) return 0x800001feu; /* SCE_KERNEL_ERROR_INVALID_VALUE */
+     return ge_get_cmd(A0);
+@@ -303,6 +362,14 @@ void sr_hle_test_ge_preempt_hook(void (*hook)(uint32_t list_id)) { s_ge_test_pre
+  * list to its END has done everything that follows the END. */
+ static int ge_list_run(int slot, uint32_t pc, int resume, uint32_t *next_pc) {
+     GeListInfo *l = &s_ge_lists[slot];
++    if (ge_worker_on()) {
++        /* posted: "taken over" for the caller, the end comes back through ge_async_poll */
++        l->current_pc = pc;
++        l->preempted = 0;
++        ge_worker_run(slot, pc, resume, l->stall_addr, l->signal_stacks);
++        (void)next_pc;
++        return 0;
++    }
+     const uint64_t order = l->order;
+     for (;;) {
+         int stopped = 0;
+@@ -402,6 +469,7 @@ static void ge_lists_finish_stopped(CpuState *s) {
+ }
+ 
+ static uint32_t h_GeListEnQueue(CpuState *s) {
++    ge_async_poll(s);
+     uint32_t list = A0;
+     uint32_t stall = A1;
+     uint32_t cbid = A2;
+@@ -457,6 +525,7 @@ static uint32_t h_GeListEnQueue(CpuState *s) {
+  * outstanding, queue order would matter and this runtime cannot honor head
+  * insertion yet. */
+ static uint32_t h_GeListEnQueueHead(CpuState *s) {
++    ge_async_settle(s);
+     ge_lists_finish_stopped(s);
+     for (int i = 0; i < GE_LIST_MAX; i++) {
+         if (s_ge_lists[i].status == GE_LIST_STALLED || s_ge_lists[i].status == GE_LIST_PAUSED) {
+@@ -468,6 +537,7 @@ static uint32_t h_GeListEnQueueHead(CpuState *s) {
+ }
+ 
+ static uint32_t h_GeListUpdateStallAddr(CpuState *s) {
++    ge_async_poll(s);
+     uint32_t list_id = A0;
+     uint32_t new_stall = A1;
+ 
+@@ -525,6 +595,7 @@ static uint32_t h_GeListUpdateStallAddr(CpuState *s) {
+                 list_id, s_ge_lists[slot].stall_addr, s_ge_lists[slot].current_pc, new_stall);
+ 
+     s_ge_lists[slot].stall_addr = new_stall;
++    if (ge_worker_on() && ge_worker_inflight(slot)) return 0;   /* its run's end runs it on to the new stall */
+ 
+     uint32_t next_pc = 0;
+     if (!ge_list_run(slot, s_ge_lists[slot].current_pc, 1, &next_pc)) { // 1 = resume
+@@ -578,6 +649,13 @@ static uint32_t h_GeListSync(CpuState *s) {
+     uint32_t qid = A0;
+     uint32_t syncType = A1;
+     int slot = ge_list_slot(qid);
++    if (ge_worker_on() && slot >= 0) {
++        if (syncType == 0u) ge_async_wait(s, slot);
++        else {
++            ge_async_poll(s);
++            if (ge_worker_inflight(slot)) return GE_SYNC_DRAWING;
++        }
++    }
+     SR_FLIGHT_RECORD_CLASS(SR_FLIGHT_CLASS_GE, SR_FLIGHT_KIND_GE_LIST_SYNC,
+                            qid, slot >= 0 ? s_ge_lists[slot].start_pc : 0u,
+                            slot >= 0 ? s_ge_lists[slot].stall_addr : 0u, syncType);
+@@ -683,6 +761,13 @@ static uint32_t h_GeDrawSync(CpuState *s) {
+      * not return in another (ge-draw-sync-after-reset-wait); with no list active this returns. */
+     uint32_t mode = A0;
+     if (mode > 1u) return GE_ERROR_INVALID_MODE;
++    if (ge_worker_on()) {
++        if (mode == 0u) ge_async_wait(s, -1);
++        else {
++            ge_async_poll(s);
++            if (ge_worker_inflight(-1)) return GE_SYNC_DRAWING;
++        }
++    }
+     int recorded = 0;
+     for (;;) {
+         ge_lists_finish_stopped(s);
+@@ -723,6 +808,7 @@ static uint32_t h_GeDrawSync(CpuState *s) {
+ }
+ 
+ static uint32_t h_GeBreak(CpuState *s) {
++    ge_async_settle(s);
+     uint32_t mode = A0;
+     uint32_t pparam = A1;
+ 
+@@ -786,6 +872,7 @@ static uint32_t h_GeBreak(CpuState *s) {
+ }
+ 
+ static uint32_t h_GeContinue(CpuState *s) {
++    ge_async_settle(s);
+     int paused_slot = -1;
+     for (int i = 0; i < GE_LIST_MAX; i++) {
+         if (s_ge_lists[i].status == GE_LIST_PAUSED) {
+@@ -832,6 +919,7 @@ static uint32_t h_GeContinue(CpuState *s) {
+  * list that has not started leaves the queue, its slot is freed and its waiters return 0
+  * (uofw sceGeListDeQueue, UNMEASURED). */
+ static uint32_t h_GeListDeQueue(CpuState *s) {
++    ge_async_settle(s);
+     uint32_t qid = A0;
+     int slot = ge_list_slot(qid);
+     if (slot < 0 || s_ge_lists[slot].status == GE_LIST_FREE) return GE_ERROR_INVALID_LIST_ID;

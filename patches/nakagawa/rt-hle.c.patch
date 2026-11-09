@@ -1,0 +1,68 @@
+diff --git a/src/rt/hle.c b/src/rt/hle.c
+index 36ebfffe..1e777c9f 100644
+--- a/src/rt/hle.c
++++ b/src/rt/hle.c
+@@ -80,12 +80,20 @@ static void hle_unsupported_summary(void) {
+     }
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* the module's say on a function the runtime refuses, the first time the game calls it (a game
++ * that hangs on the refusal, such as a mode that is ad hoc play: the module ends with its own exit code) */
++void sdk_hle_refused(const char *name, uint32_t nid) __attribute__((weak));
++#endif
+ static void hle_note_unsupported(HleEntry *e) {
+     if (atomic_exchange_explicit(&e->unsupported_state, 1u, memory_order_acq_rel))
+         return;
+     hle_register_unsupported_summary();
+     fprintf(stderr, "HLE: controlled refusal: %s (NID 0x%08x) returned 0x%08x; in the works (#341)\n",
+             e->name, e->nid, e->unsupported_error);
++#ifdef SR_GE_NATIVE
++    if (sdk_hle_refused) sdk_hle_refused(e->name, e->nid);
++#endif
+ }
+ 
+ /* One stderr line the first time a NID with no recorded evidence runs its handler. Diagnostic
+@@ -248,11 +256,24 @@ void sr_hle_register_unsupported(uint32_t nid, const char *name, uint32_t error)
+     sr_hle_register_entry(nid, name, h_ControlledUnsupported, error);
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* a NID's entry, remembered (so an import call doesn't scan the whole table under the lock). The table only grows and an entry's
++ * NID never changes once written, so a slot read without the lock that names this NID is its entry. */
++static HleEntry *_Atomic s_nid_cache[4096];
++#endif
+ HleEntry *hle_find(uint32_t nid) {
++#ifdef SR_GE_NATIVE
++    _Atomic(HleEntry *) *slot = &s_nid_cache[(nid ^ (nid >> 12)) & 4095u];
++    HleEntry *cached = atomic_load_explicit(slot, memory_order_acquire);
++    if (cached && cached->nid == nid) return cached;
++#endif
+     HleEntry *result = NULL;
+     hle_lock();
+     for (int i = 0; i < s_hle_n; i++) if (s_hle[i].nid == nid) { result = &s_hle[i]; break; }
+     hle_unlock();
++#ifdef SR_GE_NATIVE
++    if (result) atomic_store_explicit(slot, result, memory_order_release);
++#endif
+     return result;
+ }
+ 
+@@ -3799,6 +3820,7 @@ static const char *hle_watchdog_nid_name(uint32_t nid) {
+     return e ? e->name : sr_nid_name(nid);
+ }
+ 
++void sr_hle_register_sdk(void) __attribute__((weak));
+ void sr_hle_init(void) {
+     int expected = 0;
+     if (!atomic_compare_exchange_strong_explicit(&s_hle_init_state, &expected, 1,
+@@ -3967,6 +3989,9 @@ void sr_hle_init(void) {
+     (void)ge_timing_on();
+     sched_set_vtimer_hooks(vtimer_next_deadline_us, vtimer_service_one);
+ #endif
++    /* Deadstation Portable's recomp SDK: its own handlers, after these (runtime/hle_sdk.c) */
++    if (sr_hle_register_sdk)
++        sr_hle_register_sdk();
+     atomic_store_explicit(&s_hle_init_state, 2, memory_order_release);
+ }
+ 

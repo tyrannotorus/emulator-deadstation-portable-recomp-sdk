@@ -1,0 +1,14 @@
+diff --git a/src/rt/hle_internal.h b/src/rt/hle_internal.h
+index 5b7606bf..0d674a1b 100644
+--- a/src/rt/hle_internal.h
++++ b/src/rt/hle_internal.h
+@@ -406,6 +406,9 @@ typedef struct {
+      * element produces exactly one message and a reset stream can report the next one. */
+     int rejectNamed;
+     char path[512]; SrPsmfQueue q[PSMF_TRACKS][PSMF_Q_STAGES];
++    /* the picture last handed out, rows of lastPicRowBytes, to write again into the buffer of
++     * a call that steps no picture (scePsmfPlayerGetVideoData) */
++    uint8_t *lastPic; uint32_t lastPicRowBytes, lastPicRows, lastPicCap;
+ } SrPsmfPlayer;
+ 
+ /* ---- PSMF A/V offset where pictures are presented and audio is played (issue #279) -------

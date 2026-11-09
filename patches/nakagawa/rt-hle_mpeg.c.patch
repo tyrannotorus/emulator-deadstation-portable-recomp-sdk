@@ -1,0 +1,106 @@
+diff --git a/src/rt/hle_mpeg.c b/src/rt/hle_mpeg.c
+index 1ff54ac6..0a158ea0 100644
+--- a/src/rt/hle_mpeg.c
++++ b/src/rt/hle_mpeg.c
+@@ -388,6 +388,11 @@ static void psmf_media_reset(SrPsmfPlayer *p) {
+     p->atracChannels = p->atracAlign = 0;
+     free(p->audioPcm);
+     p->audioPcm = NULL;
++#ifdef SR_GE_NATIVE
++    free(p->lastPic);
++    p->lastPic = NULL;
++    p->lastPicCap = p->lastPicRowBytes = p->lastPicRows = 0;
++#endif
+     p->audioPcmSampleCount = p->audioPcmValid = 0;
+     p->audioPcmPts = 0; p->audioPcmPtsValid = 0;
+     p->audioDisplayPts = 0; p->audioDisplayPtsValid = 0;
+@@ -516,7 +521,7 @@ uint32_t sr_hle_test_psmf_video_submit_limit(int producer_eof) {
+ /* One decoded picture straight into the guest display buffer.  1 = written, 0 = nothing
+  * ready yet, -1 = decoder failure. */
+ static int psmf_video_take(SrPsmfPlayer *p, uint32_t displaybuf, int bufw,
+-                           int pixelMode, int64_t *pts_out) {
++                           int pixelMode, int64_t *pts_out, SrH264FrameInfo *info_out) {
+     if (!p || p->h264 < 0) return 0;
+     int eos = psmf_video_eos_ready(p);
+     SrH264FrameTarget target;
+@@ -566,6 +571,7 @@ static int psmf_video_take(SrPsmfPlayer *p, uint32_t displaybuf, int bufw,
+             psmf_av_delivered(PSMF_AV_VIDEO, displaybuf, 0u, value, 1);
+     }
+     p->videoFramesOut++;
++    if (info_out) *info_out = info;
+     return 1;
+ }
+ 
+@@ -997,9 +1003,71 @@ static uint32_t h_PsmfGetVideo(CpuState *s) {
+         return PSMF_ERR_INVALID_POINTER;
+     psmf_produce(p);
+     psmf_video_pump(p);
++#ifdef SR_GE_NATIVE
++    /* As PPSSPP's: the video steps a picture only while it isn't ahead of the audio handed out
++     * (and catches up, picture after picture, once 5 behind), and every call writes the current picture into the buffer it is
++     * given and succeeds: a game shows the buffer it asked for whatever the call returns (a game rotating three buffers would show
++     * a picture three calls old) */
++    const int stride_px = bufw == 0 ? 512 : (int)((uint32_t)bufw & ~1u);
++    int step = p->playMode != PSMF_PLAY_MODE_PAUSE &&
++               !(p->displayPtsValid && p->audioDisplayPtsValid && p->displayPts > p->audioDisplayPts);
++    int64_t pts = 0;
++    int r = 0;
++    SrH264FrameInfo info;
++    if (step || !p->lastPic) {
++        r = psmf_video_take(p, displaybuf, stride_px, (int)p->pixelMode, &pts, &info);
++        while (r > 0 && p->audioDisplayPtsValid && p->displayPts <= p->audioDisplayPts - 5 * PSMF_VIDEO_PTS_STEP) {
++            int64_t pts2 = 0;
++            SrH264FrameInfo info2;
++            if (psmf_video_take(p, displaybuf, stride_px, (int)p->pixelMode, &pts2, &info2) <= 0) break;
++            pts = pts2;
++            info = info2;
++        }
++        if (r > 0) {   /* the picture kept, row by row, to write again */
++            const uint32_t bpp = info.delivered_format == SR_H264_PIXEL_8888 ? 4u : 2u;
++            const uint32_t rowb = (uint32_t)info.width * bpp, rows = (uint32_t)info.height;
++            if (rowb * rows > p->lastPicCap) {
++                free(p->lastPic);
++                p->lastPic = malloc((size_t)rowb * rows);
++                p->lastPicCap = p->lastPic ? rowb * rows : 0u;
++            }
++            if (p->lastPic) {
++                for (uint32_t y = 0; y < rows; y++)
++                    memcpy(p->lastPic + (size_t)y * rowb, SR_HOST(displaybuf + y * (uint32_t)stride_px * bpp), rowb);
++                p->lastPicRowBytes = rowb;
++                p->lastPicRows = rows;
++            }
++        }
++    }
++    if (r < 0) return PSMF_ERR_NO_DATA;   /* a decoder error: counted (videoErrors) */
++    const int stepped = r > 0;
++    if (r == 0) {   /* no picture stepped: the current one again */
++        if (!p->lastPic || !p->lastPicRows) return PSMF_ERR_NO_DATA;
++        const uint32_t bpp = p->pixelMode == 3u ? 4u : 2u;
++        if (p->lastPicRowBytes > (uint32_t)stride_px * bpp ||
++            !sr_guest_span_writable_any_view(displaybuf, ((p->lastPicRows - 1u) * (uint32_t)stride_px * bpp) + p->lastPicRowBytes))
++            return PSMF_ERR_INVALID_POINTER;
++        for (uint32_t y = 0; y < p->lastPicRows; y++)
++            memcpy(SR_HOST(displaybuf + y * (uint32_t)stride_px * bpp), p->lastPic + (size_t)y * p->lastPicRowBytes, p->lastPicRowBytes);
++        pts = p->displayPts;
++        r = 1;
++    }
++#else
+     int64_t pts = 0;
+     int r = psmf_video_take(p, displaybuf, bufw == 0 ? 512 : (int)((uint32_t)bufw & ~1u),
+-                            (int)p->pixelMode, &pts);
++                            (int)p->pixelMode, &pts, NULL);
++#endif
++#ifdef SR_GE_NATIVE
++    {   /* (dev, DSP_PSMFLOG=1) each call: the buffer, the result, the picture's pts, the audio's */
++        static int plog = -1, said;
++        if (plog < 0) plog = getenv("DSP_PSMFLOG") != NULL;
++        if (plog && said < 400) {
++            said++;
++            fprintf(stderr, "PSMFLOG video buf 0x%08x stepped %d pts %lld audio pts %lld\n", displaybuf, stepped, (long long)pts,
++                    (long long)p->audioDisplayPts);
++        }
++    }
++#endif
+     if (r <= 0) return PSMF_ERR_NO_DATA;
+     sched_delay_current(PSMF_VIDEO_DATA_DELAY_US);
+     MEM_W32(A1 + 4, displaybuf);

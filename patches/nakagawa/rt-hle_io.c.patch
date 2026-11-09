@@ -1,0 +1,71 @@
+diff --git a/src/rt/hle_io.c b/src/rt/hle_io.c
+index 14de0c21..02b98738 100644
+--- a/src/rt/hle_io.c
++++ b/src/rt/hle_io.c
+@@ -1222,6 +1222,9 @@ static uint32_t io_async_submit(uint32_t fd, IoAsyncOp op, uint32_t a1,
+     uint32_t callback_arg = request->callback_arg;
+     memset(request, 0, sizeof(*request));
+     request->state = IO_ASYNC_PENDING;
++#ifdef SR_GE_NATIVE
++    { extern int g_io_async_maybe_pending; g_io_async_maybe_pending = 1; }
++#endif
+     request->op = op;
+     request->submitted_epoch = s_io_dispatch_epoch;
+     request->sequence = ++s_io_async_sequence;
+@@ -1765,6 +1768,7 @@ static uint32_t h_IoChdir(CpuState *s) {
+ #define IO_MODE_REGULAR 0x00002000u
+ #define IO_MODE_DIRECTORY 0x00001000u
+ 
++int32_t sr_savedata_console_offset_minutes(void);   /* hle.c: the console's zone */
+ static uint32_t h_IoChstat(CpuState *s) {
+     char guest[512], rel[SR_CD_REL_MAX];
+     uint32_t rc = io_guest_path(A0, guest, sizeof(guest));
+@@ -1772,14 +1776,41 @@ static uint32_t h_IoChstat(CpuState *s) {
+     if (sr_flash0_font_is_device_path(guest))
+         return sr_flash0_font_refuse_write(guest, "change attributes");
+     uint32_t bits = A2;
+-    if ((bits & ~IO_CSTAT_MODE) != 0u) {
+-        fprintf(stderr,
+-                "SEMANTIC_BOUNDARY: IO_CHSTAT_NON_MODE_FIELDS: sceIoChstat fields "
+-                "other than mode are not supported yet (0x80010086)\n");
+-        return 0x80010086u;
+-    }
+     if (bits == 0u) return 0u;
+-    if (!A1 || !sr_guest_span_readable(A1, 4u)) return 0x80010016u;
++    if (!A1 || !sr_guest_span_readable(A1, (bits & ~IO_CSTAT_MODE) ? 0x58u : 4u)) return 0x80010016u;
++    if (bits & ~IO_CSTAT_MODE) {
++        /* the other fields (the game's Install sets them on every file it writes): size (0x04)
++         * truncates or extends, access (0x10) and modification (0x20) times are set (ScePspDateTime in the console's local
++         * time, at 32 and 48); attributes (0x02), creation time (0x08, no host can set it) and the private words (0x40) have
++         * nothing on the host to change and are taken as done, as PPSSPP takes every field */
++        uint32_t lba0, size0;
++        if (iso_lookup(guest, &lba0, &size0) == 0) return 0x8001001eu;
++        const int set_size = (bits & 0x04u) != 0u, set_at = (bits & 0x10u) != 0u, set_mt = (bits & 0x20u) != 0u;
++        const uint64_t size = (uint64_t)MEM_R32(A1 + 8u) | ((uint64_t)MEM_R32(A1 + 12u) << 32);
++        int64_t when[2] = { 0, 0 };
++        for (int k = 0; k < 2; k++) {
++            const uint32_t t = A1 + (k ? 48u : 32u);
++            int64_t y = MEM_R16(t), m = MEM_R16(t + 2u), d = MEM_R16(t + 4u);
++            const int64_t hh = MEM_R16(t + 6u), mm = MEM_R16(t + 8u), ss = MEM_R16(t + 10u);
++            y -= m <= 2;   /* days from the civil date (the inverse of savedata.c's put_psp_time) */
++            const int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
++            const int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++            when[k] = (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss -
++                      (int64_t)sr_savedata_console_offset_minutes() * 60;
++        }
++        sr_cd_status st = sr_cd_ms0_guest_relpath(guest, rel, sizeof(rel));
++        if (st != SR_CD_OK) return sr_cd_psp_error(st);
++        if (set_size || set_at || set_mt) {
++            sr_cd_root root;
++            st = sr_cd_root_open(sr_ms0_root(), &root);
++            if (st == SR_CD_OK) {
++                st = sr_cd_set_times_size(&root, rel, set_size, size, set_at, when[0], set_mt, when[1]);
++                sr_cd_root_close(&root);
++            }
++            if (st != SR_CD_OK) return sr_cd_psp_error(st);
++        }
++        if (!(bits & IO_CSTAT_MODE)) return 0u;
++    }
+     uint32_t requested_mode = MEM_R32(A1);
+     uint32_t type = requested_mode & IO_MODE_TYPE_MASK;
+     if (type != IO_MODE_REGULAR && type != IO_MODE_DIRECTORY)

@@ -1,0 +1,17 @@
+diff --git a/src/rt/hle_cache_dma.c b/src/rt/hle_cache_dma.c
+index d75b8ba9..cbe38285 100644
+--- a/src/rt/hle_cache_dma.c
++++ b/src/rt/hle_cache_dma.c
+@@ -64,6 +64,12 @@ static void dcache_range_notify_gpu(uint32_t addr, uint32_t size) {
+ }
+ 
+ static void dcache_all_notify_gpu(void) {
++#ifdef SR_GE_NATIVE
++    /* Not a texture change: a game may write the whole cache back many times a second, and a notice of all of RAM would make every
++     * texture's next use an exact compare against its shadow. Real writes come as range write-backs (still noticed), and every
++     * texture lookup still checks its sampled content hash. */
++    return;
++#endif
+     sr_gpu_vram_dirty(SR_RAM_BASE, SR_DCACHE_RAM_BYTES);
+ }
+ 

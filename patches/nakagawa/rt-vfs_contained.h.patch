@@ -1,0 +1,102 @@
+diff --git a/src/rt/vfs_contained.h b/src/rt/vfs_contained.h
+index 89e17610..f6a22e71 100644
+--- a/src/rt/vfs_contained.h
++++ b/src/rt/vfs_contained.h
+@@ -544,10 +544,10 @@ static inline void sr_cd__hook_fire(int which) {
+ #endif
+ 
+ /* ======================================================================== */
+-/* Windows backend: OPEN -> HANDLE -> FINAL PATH VERIFY -> OPERATION.       */
+-/* Every step delegates to the audited helpers in vfs_path.h, so this is a  */
+-/* re-expression of the shipped F114-1 behaviour behind the neutral seam,   */
+-/* not a new Windows implementation.                                        */
++/* Windows backend: OPEN -> HANDLE -> FINAL PATH VERIFY -> OPERATION. */
++/* Every step delegates to the audited helpers in vfs_path.h, so this is a */
++/* re-expression of the shipped F114-1 behaviour behind the neutral seam, */
++/* not a new Windows implementation. */
+ /* ======================================================================== */
+ #if defined(SR_CD_BACKEND_WINDOWS)
+ 
+@@ -687,6 +687,11 @@ static inline sr_cd_status sr_cd_set_mode(const sr_cd_root *root, const char *re
+     CloseHandle(handle);
+     return changed ? SR_CD_OK : SR_CD_IO_ERROR;
+ }
++static inline sr_cd_status sr_cd_set_times_size(const sr_cd_root *root, const char *rel, int set_size, uint64_t size,
++                                                int set_atime, int64_t atime, int set_mtime, int64_t mtime) {
++    (void)root; (void)rel; (void)set_size; (void)size; (void)set_atime; (void)atime; (void)set_mtime; (void)mtime;
++    return SR_CD_UNSUPPORTED_HOST;   /* not written for this backend */
++}
+ 
+ /* ROOT BINDING (documented once, applies to both backends).
+  *
+@@ -780,7 +785,7 @@ static inline sr_cd_status sr_cd_delete_dir_shallow(const sr_cd_root *root, cons
+ }
+ 
+ /* ======================================================================== */
+-/* POSIX backend: descriptor-relative traversal and deletion.               */
++/* POSIX backend: descriptor-relative traversal and deletion. */
+ /* ======================================================================== */
+ #elif defined(SR_CD_BACKEND_POSIX_AT)
+ 
+@@ -1511,9 +1516,47 @@ static inline sr_cd_status sr_cd_set_mode(const sr_cd_root *root, const char *re
+     return status;
+ }
+ 
++/* sceIoChstat's size and times: a regular file truncated or extended to `size` (when set_size),
++ * its access and modification times (when set_atime / set_mtime: seconds since 1970 UTC). Opened as sr_cd_set_mode opens it:
++ * relative to the verified parent, never through a link, and only a regular file or a directory (times only) is touched. */
++static inline sr_cd_status sr_cd_set_times_size(const sr_cd_root *root, const char *rel, int set_size, uint64_t size,
++                                                int set_atime, int64_t atime, int set_mtime, int64_t mtime) {
++    char parent_rel[SR_CD_REL_MAX], leaf[SR_CD_NAME_MAX];
++    if (!root || root->fd < 0) return SR_CD_NOT_CONTAINED;
++    if (!sr_cd_rel_is_acceptable(rel) ||
++        !sr_cd_rel_split(rel, parent_rel, sizeof(parent_rel), leaf, sizeof(leaf)))
++        return SR_CD_INVALID_PATH;
++    int parent_fd = -1;
++    sr_cd_status status = sr_cd__at_walk(root->fd, parent_rel, &parent_fd);
++    if (status != SR_CD_OK) return status;
++    int fd = openat(parent_fd, leaf, (set_size ? O_WRONLY : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
++    if (fd < 0) {
++        status = sr_cd__at_open_fail();
++        close(parent_fd);
++        return status;
++    }
++    struct stat info;
++    status = SR_CD_OK;
++    if (fstat(fd, &info) != 0)
++        status = SR_CD_IO_ERROR;
++    else if (!S_ISREG(info.st_mode) && !((info.st_mode & S_IFMT) == S_IFDIR && !set_size))
++        status = SR_CD_NOT_CONTAINED;
++    if (status == SR_CD_OK && set_size && ftruncate(fd, (off_t)size) != 0)
++        status = SR_CD_IO_ERROR;
++    if (status == SR_CD_OK && (set_atime || set_mtime)) {
++        struct timespec ts[2];
++        ts[0].tv_sec = (time_t)atime; ts[0].tv_nsec = set_atime ? 0 : UTIME_OMIT;
++        ts[1].tv_sec = (time_t)mtime; ts[1].tv_nsec = set_mtime ? 0 : UTIME_OMIT;
++        if (futimens(fd, ts) != 0) status = SR_CD_IO_ERROR;
++    }
++    close(fd);
++    close(parent_fd);
++    return status;
++}
++
+ /* ======================================================================== */
+-/* Fail-closed backend for hosts with no containment implementation yet.    */
+-/* Deliberately destroys nothing rather than offering a pathname fallback.  */
++/* Fail-closed backend for hosts with no containment implementation yet. */
++/* Deliberately destroys nothing rather than offering a pathname fallback. */
+ /* ======================================================================== */
+ #else
+ 
+@@ -1579,6 +1622,11 @@ static inline sr_cd_status sr_cd_set_mode(const sr_cd_root *root, const char *re
+     (void)root; (void)rel; (void)mode;
+     return SR_CD_UNSUPPORTED_HOST;
+ }
++static inline sr_cd_status sr_cd_set_times_size(const sr_cd_root *root, const char *rel, int set_size, uint64_t size,
++                                                int set_atime, int64_t atime, int set_mtime, int64_t mtime) {
++    (void)root; (void)rel; (void)set_size; (void)size; (void)set_atime; (void)atime; (void)set_mtime; (void)mtime;
++    return SR_CD_UNSUPPORTED_HOST;
++}
+ 
+ #endif
+ 

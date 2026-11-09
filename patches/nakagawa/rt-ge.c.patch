@@ -1,0 +1,1898 @@
+diff --git a/src/rt/ge.c b/src/rt/ge.c
+index daf2aead..9c200425 100644
+--- a/src/rt/ge.c
++++ b/src/rt/ge.c
+@@ -175,7 +175,17 @@ enum {
+ };
+ 
+ /* GeState now lives in ge_shared.h (shared with the optional GPU backend). */
++#ifdef SR_GE_NATIVE
++/* The GE in two stages: this file's state is the front's (ge_live, the list's thread); the
++ * back stage (the renderer, on a thread of its own) sees a copy as of each operation it runs (s_back_state). `ge` is per thread: the
++ * front's own, or on the back stage's thread the copy, so this file's functions the renderer calls (the texture decoders) read the
++ * state the operation had. */
++static GeState ge_live;
++static __thread GeState *t_ge = &ge_live;
++#define ge (*t_ge)
++#else
+ static GeState ge;
++#endif
+ /* CLUT loads seen, for ge_clut_load_extent. Process-lifetime counters, like PPSSPP's clutTotalBytes_ and
+  * clutMaxBytes_ (never reset), kept outside GeState so the capture format and its size check stay as
+  * they are: a capture replay or snapshot restore does not reset them, and a run that has seen no
+@@ -184,6 +194,12 @@ static uint32_t s_clut_last_bytes, s_clut_max_bytes;
+ /* Bumped whenever GE state may change (every list command, init, replay restore); state
+  * derived from registers and cached between commands is keyed on it (light_consts). */
+ static uint32_t s_ge_state_serial;
++#ifdef SR_GE_NATIVE
++static uint32_t s_ge_render_serial;   /* the state the renderer reads: every command but a matrix's */
++static int s_split_on;   /* the renderer runs on its own thread (split_wrap) */
++static GeState s_back_state;   /* the renderer's copy of the state, and of the counters it keys its caches on */
++static struct { uint32_t serial, run_gen, clut_gen, clut_last, clut_max; } s_back_x;   /* SplitX, below */
++#endif
+ static uint32_t s_ge_command[256];
+ static int s_ge_inited = 0;
+ static GeCpuProfileStats s_cpu_profile_stats;
+@@ -774,10 +790,19 @@ static int s_wing_x0, s_wing_x1;  /* canvas columns that pass may write, inclusi
+ volatile int g_sr_vram_read_pending;
+ 
+ void sr_vram_mark_renderer_pending(void) {
++#ifdef SR_GE_NATIVE
++    return;
++#endif
+     g_sr_vram_read_pending = 1;
+ }
+ 
++#ifdef SR_GE_NATIVE
++static const GeGpuHooks *split_wrap(const GeGpuHooks *h);
++#endif
+ void ge_set_gpu_hooks(const GeGpuHooks *h) {
++#ifdef SR_GE_NATIVE
++    h = split_wrap(h);   /* the renderer behind the two stages' queue */
++#endif
+     s_gpu = h;
+ }
+ const GeGpuHooks *ge_get_gpu_hooks(void) { return s_gpu; }
+@@ -796,19 +821,56 @@ void ge_set_draw_observer(GeDrawObserver fn, void *ctx) {
+ }
+ GeState *ge_state_ptr(void) { return &ge; }
+ 
++#ifdef SR_GE_NATIVE
++static uint32_t s_clut_unsent;   /* the CLUT RAM bytes loaded since the renderer's copy was last sent */
++#endif
+ void ge_clut_note_load(uint32_t bytes) {
+     if (!bytes) return;   /* as PPSSPP's LoadClut: a zero-length load changes nothing */
++#ifdef SR_GE_NATIVE
++    if (bytes > s_clut_unsent) s_clut_unsent = bytes;
++#endif
+     s_clut_last_bytes = bytes;
+     if (bytes > s_clut_max_bytes) s_clut_max_bytes = bytes;
+ }
+ 
+ void ge_clut_load_extent(uint32_t *last_bytes, uint32_t *max_bytes) {
++#ifdef SR_GE_NATIVE
++    if (s_split_on) {
++        if (last_bytes) *last_bytes = s_back_x.clut_last;   /* the renderer's copy */
++        if (max_bytes) *max_bytes = s_back_x.clut_max;
++        return;
++    }
++#endif
+     if (last_bytes) *last_bytes = s_clut_last_bytes;
+     if (max_bytes) *max_bytes = s_clut_max_bytes;
+ }
++#ifdef SR_GE_NATIVE
++int ge_worker_on(void);
++/* the GE in two stages: on unless DSP_GE_SPLIT=0 (dev) or the lists run on the game's thread (DSP_GE_SYNC=1) */
++static int split_wanted(void) {
++    static int wanted = -1;
++    if (wanted < 0) {
++        const char *e = getenv("DSP_GE_SPLIT");
++        wanted = !(e && e[0] == '0') && ge_worker_on();
++    }
++    return wanted;
++}
++/* the renderer's view: its copy in two stages, the live state and counts in one */
++uint32_t ge_state_serial(void) { return s_split_on ? s_back_x.serial : s_ge_state_serial; }
++uint32_t ge_run_gen(void) { return s_split_on ? s_back_x.run_gen : g_ge_run_gen; }
++uint32_t ge_clut_gen(void) { return s_split_on ? s_back_x.clut_gen : g_ge_clut_gen; }
++GeState *ge_backend_state_ptr(void) { return split_wanted() ? &s_back_state : &ge_live; }
++void ge_state_note_external_write(void) { s_ge_state_serial++; s_ge_render_serial++; }
++#else
+ uint32_t ge_state_serial(void) { return s_ge_state_serial; }
+ void ge_state_note_external_write(void) { s_ge_state_serial++; }
++#endif
++int  ge_worker_on(void);
++int  ge_worker_is_self(void);
++void ge_worker_vram_dirty(uint32_t addr, uint32_t bytes);
+ void sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes) {
++    /* the CPU's write reaches the renderer on the GE worker's thread, before the next list */
++    if (ge_worker_on() && !ge_worker_is_self()) { ge_worker_vram_dirty(addr, bytes); return; }
+     if (s_gpu && s_gpu->vram_dirty) s_gpu->vram_dirty(addr, bytes);
+ }
+ 
+@@ -988,6 +1050,9 @@ int ge_zbuf_materialize_current(void) {
+ }
+ 
+ int ge_zbuf_prepare_current(void) {
++#ifdef SR_GE_NATIVE
++    return 1;   /* no CPU copy of the depth surface: the GPU's is the only one (and the GE runs on its own thread) */
++#endif
+     uint32_t base = ge.zbp ? SR_PHYS(ge.zbp) : SR_VRAM_CPU_BASE;
+     if (base < 0x00200000u) base += SR_VRAM_CPU_BASE;
+     uint32_t stride = zbuf_stride();
+@@ -1028,10 +1093,15 @@ int ge_zbuf_prepare_current(void) {
+ static void ge_zbuf_note_write(void) {
+     if (!s_zbuf_guest_valid) return;
+     s_zbuf_guest_dirty = 1;
++#ifndef SR_GE_NATIVE
+     g_sr_vram_read_pending = 1;
++#endif
+ }
+ 
+ void ge_zbuf_note_external_write(void) {
++#ifdef SR_GE_NATIVE
++    return;
++#endif
+     uint32_t base = ge.zbp ? SR_PHYS(ge.zbp) : SR_VRAM_CPU_BASE;
+     if (base < 0x00200000u) base += SR_VRAM_CPU_BASE;
+     uint32_t stride = zbuf_stride();
+@@ -1061,6 +1131,13 @@ static void ge_vram_coherence_failure(const char *code, const char *sentence) {
+ }
+ 
+ void sr_ge_vram_read_prepare(uint32_t physical_addr, uint32_t width) {
++#ifdef SR_GE_NATIVE
++    /* rendered surfaces stay on the GPU and the CPU depth surface isn't kept for the CPU:
++     * a CPU read of VRAM is a plain load, nothing to materialize */
++    (void)physical_addr; (void)width;
++    g_sr_vram_read_pending = 0;
++    return;
++#endif
+     if (s_zbuf_guest_dirty && ge_zbuf_range_overlaps(physical_addr, width) &&
+         !ge_zbuf_materialize_current())
+         ge_vram_coherence_failure("VRAM_DEPTH_WRITEBACK_FAILED",
+@@ -1074,6 +1151,10 @@ void sr_ge_vram_read_prepare(uint32_t physical_addr, uint32_t width) {
+ }
+ 
+ void sr_ge_vram_write_prepare(uint32_t physical_addr, uint32_t width) {
++#ifdef SR_GE_NATIVE
++    (void)physical_addr; (void)width;
++    return;   /* nothing to preserve before a CPU store */
++#endif
+     uint32_t canonical = sr_vram_cpu_aperture(physical_addr)
+                        ? sr_vram_cpu_address(physical_addr) : SR_PHYS(physical_addr);
+     if (s_zbuf_guest_dirty && ge_zbuf_range_overlaps(canonical, width) &&
+@@ -1094,8 +1175,10 @@ void sr_ge_vram_write_commit(uint32_t physical_addr, uint32_t width) {
+         s_zbuf_guest_dirty = 0;
+     }
+     sr_gpu_vram_dirty(physical_addr, width);
++#ifndef SR_GE_NATIVE
+     g_sr_vram_read_pending = s_zbuf_guest_dirty ||
+         (s_gpu && s_gpu->vram_pending && s_gpu->vram_pending());
++#endif
+ }
+ 
+ uint16_t *ge_zbuf_ptr(void) {
+@@ -1291,6 +1374,14 @@ static int s_vtx_linear;
+ 
+ static void vtx_linear_begin(uint32_t addr, const VFmt *v) {
+     s_vtx_linear = ge_ram_span(addr, (uint32_t)v->stride) != NULL;
++#ifdef SR_GE_NATIVE
++    /* a vertex in the plain VRAM view is memory too , read directly */
++    if (!s_vtx_linear) {
++        const uint32_t vo = SR_PHYS(addr) - 0x04000000u;
++        s_vtx_linear = vo < 0x00200000u && vo + (uint32_t)v->stride <= 0x00200000u &&
++                       !(addr <= 0x04084003u && addr + (uint32_t)v->stride > 0x04084000u);
++    }
++#endif
+ }
+ static void vtx_linear_end(void) { s_vtx_linear = 0; }
+ 
+@@ -4431,6 +4522,16 @@ static int transform_vtx_3d(uint32_t addr, const VFmt *vf, Vtx *o) {
+  * above 0x100 (every vertex is tested here).  Whether BOUNDINGBOX advances VADDR/IADDR as PRIM does is also unmeasured;
+  * it leaves them unchanged. */
+ #define GE_BBOX_GUARD_PX 1.0f
++/* Vert+'s rows above and below the PSP's 272 (the module's sdk_vplus_rows, as ge_gpu.c's s_vpad) */
++int sdk_vplus_rows(void) __attribute__((weak));
++static int ge_vplus_rows(void) {
++    static int rows = -1;
++    if (rows < 0) {
++        rows = sdk_vplus_rows ? sdk_vplus_rows() : 0;
++        rows = rows < 0 ? 0 : rows > 128 ? 128 : rows;
++    }
++    return rows;
++}
+ static int ge_bounding_box_visible(uint32_t count) {
+     VFmt vf;
+     decode_vtype(ge.vtype, &vf);
+@@ -4452,6 +4553,11 @@ static int ge_bounding_box_visible(uint32_t count) {
+     float right = (float)ge.scis_x2 + 1.0f + GE_BBOX_GUARD_PX;
+     float top = (float)ge.scis_y1 - GE_BBOX_GUARD_PX;
+     float bottom = (float)ge.scis_y2 + 1.0f + GE_BBOX_GUARD_PX;
++    /* Vert+: a scissor over the PSP's whole height reaches the rows above and below (as the renderer's does), so an
++     * object only there is drawn, not skipped until the camera brings it into the PSP's rows */
++    const int vrows = ge_vplus_rows();
++    const int vext = vrows && ge.scis_y1 <= 0 && ge.scis_y2 >= 271;
++    if (vext) { top -= (float)vrows; bottom += (float)vrows; }
+     unsigned beyond_all = 0xFu;   /* edges every vertex so far lies beyond */
+     for (uint32_t i = 0; i < count && beyond_all; i++) {
+         uint32_t vi = idxfmt ? index_value(ge.iaddr, idxfmt, (int)i) : i;
+@@ -5130,6 +5236,10 @@ static void ge_note_mip_draw(void) {
+             (int)(ge.tex_lod_bias * 16.0f));
+ }
+ 
++#ifdef SR_GE_NATIVE
++static int ge_tnl_try_patch(const VFmt *vf, const ModelVtx *all, int nu, int pu, int pv, int tu, int tv, int spline, int typeu,
++                            int typev);
++#endif
+ static void draw_patch(uint32_t op,int spline){
+     int nu=(int)(op&255),nv=(int)((op>>8)&255);
+     VFmt vf;decode_vtype(ge.vtype,&vf);int idxfmt=(int)((ge.vtype>>11)&3),count=nu*nv;
+@@ -5147,6 +5257,11 @@ static void draw_patch(uint32_t op,int spline){
+         if(tv>1)tv--;
+     }
+     int prim=(int)(ge.patch_primitive&3),typeu=(int)((op>>16)&3),typev=(int)((op>>18)&3);
++#ifdef SR_GE_NATIVE
++    /* a patch of triangles to the GPU's T&L in one PRIM: each point of its grid evaluated once, not
++     * every triangle transformed and drawn here one by one (the credits' 150 ms a frame) */
++    if(prim==0&&ge_tnl_try_patch(&vf,all,nu,pu,pv,tu,tv,spline,typeu,typev)){free(all);return;}
++#endif
+     for(int py=0;py<pv;py++)for(int px=0;px<pu;px++){
+         int base=(spline?py:py*3)*nu+(spline?px:px*3);
+         for(int y=0;y<tv;y++)for(int x=0;x<tu;x++){
+@@ -5192,7 +5307,11 @@ void ge_tnl_counts(unsigned long long *taken, unsigned long long *cpu, int reset
+ static int tnl_enabled(void) {
+     if (s_tnl_on < 0) {
+         const char *on = getenv("SR_GPU_TNL");
++#ifdef SR_GE_NATIVE
++        s_tnl_on = !(on && strcmp(on, "0") == 0);   /* the GPU transforms vertices unless SR_GPU_TNL=0 */
++#else
+         s_tnl_on = on && strcmp(on, "1") == 0;
++#endif
+     }
+     return s_tnl_on;
+ }
+@@ -5201,6 +5320,10 @@ static int tnl_enabled(void) {
+  * shader forms from these inputs can overflow or become subnormal (a GPU may flush a subnormal
+  * to zero where the host keeps it). */
+ static int tnl_num_ok(float f) {
++#ifdef SR_GE_NATIVE
++    (void)f;
++    return 1;   /* the GPU's own float behaviour is the native one */
++#endif
+     if (f == 0.0f) return 1;
+     float a = fabsf(f);
+     return a >= 0x1p-40f && a <= 0x1p40f;
+@@ -5214,9 +5337,17 @@ static int tnl_nums_ok(const float *f, int n) {
+ 
+ /* State that changes nothing per vertex: the parts of the PRIM's state the shader supports. */
+ static int tnl_state_ok(int type, const VFmt *vf) {
++#ifdef SR_GE_NATIVE
++    if (type < 3 || type > 5 || vf->through || ge.clear) return 0;   /* flat shading too: psp.frag's F_FLAT */
++#else
+     if (type < 3 || type > 5 || vf->through || ge.clear || !ge.shade_gouraud) return 0;
++#endif
+     if (s_ge_timing_model || s_rtrace > 0 || s_primitive_profile > 0) return 0;
++#ifndef SR_GE_NATIVE   /* the shader generates them natively */
+     if (ge.tex_enable && (ge.tex_map_mode & 3u) != 0u) return 0;
++#else
++    if (ge.tex_enable && (ge.tex_map_mode & 3u) == 3u) return 0;   /* mode 3 is undefined */
++#endif
+     if (!tnl_nums_ok(ge.world, 12) || !tnl_nums_ok(ge.view, 12) || !tnl_nums_ok(ge.proj, 16))
+         return 0;
+     if (vf->w_n && !tnl_nums_ok(ge.bone, 12 * vf->w_n)) return 0;
+@@ -5234,8 +5365,10 @@ static int tnl_state_ok(int type, const VFmt *vf) {
+         for (int i = 0; i < GE_TNL_LIGHTS; i++) {
+             if (!ge.light_on[i]) continue;
+             int comp = (int)(ge.light_type[i] & 3u);
++#ifndef SR_GE_NATIVE   /* natively the shader's pow is the specular power */
+             if (((comp & 1) || (comp == 2 && ge.spec_coef > 0.0f)) && !s_ge_pow_exact)
+                 return 0;   /* the C library's powf: no shader counterpart */
++#endif
+             if (!tnl_nums_ok(ge.light_pos[i], 3) || !tnl_nums_ok(ge.light_att[i], 3)) return 0;
+         }
+     }
+@@ -5246,6 +5379,66 @@ static int tnl_state_ok(int type, const VFmt *vf) {
+  * (skinned when the format has weights). Every tested quantity is affine in the position or a
+  * ratio of affine ones with cw > 0, so its extremes over the box are at corners; the margins
+  * are far wider than float rounding. */
++#ifdef SR_GE_NATIVE
++/* The same test in float, through one matrix: projection x view x world made once per
++ * PRIM, the box's centre transformed once and each corner its sum with the three signed half-edges. The tested margins are
++ * far wider than float's rounding. */
++/* projection x view x world: 4 columns of 4 (m[4 * c + a]: row a of column c, column 3 the translation) */
++static void tnl_mvp(float m[16]) {
++    /* made once while the GE state is the same */
++    static float s_m[16];
++    static uint32_t s_serial = 0xFFFFFFFFu;
++    if (s_serial == s_ge_state_serial) { memcpy(m, s_m, sizeof(s_m)); return; }
++    float vw[12];
++    for (int c = 0; c < 4; c++)
++        for (int a = 0; a < 3; a++)
++            vw[3 * c + a] = ge.view[a] * ge.world[3 * c] + ge.view[3 + a] * ge.world[3 * c + 1] + ge.view[6 + a] * ge.world[3 * c + 2] +
++                            (c == 3 ? ge.view[9 + a] : 0.0f);
++    for (int c = 0; c < 4; c++)
++        for (int a = 0; a < 4; a++)
++            m[4 * c + a] = ge.proj[a] * vw[3 * c] + ge.proj[4 + a] * vw[3 * c + 1] + ge.proj[8 + a] * vw[3 * c + 2] +
++                           (c == 3 ? ge.proj[12 + a] : 0.0f);
++    memcpy(s_m, m, sizeof(s_m));
++    s_serial = s_ge_state_serial;
++}
++static int tnl_corners_ok(const double lo[3], const double hi[3], float box[4]) {
++    const float vxs = decode_float24(ge.viewport_raw[0]), vys = decode_float24(ge.viewport_raw[1]);
++    const float vzs = decode_float24(ge.viewport_raw[2]), vxc = decode_float24(ge.viewport_raw[3]);
++    const float vyc = decode_float24(ge.viewport_raw[4]), vzc = decode_float24(ge.viewport_raw[5]);
++    const float offx = (float)(ge.offsetx & 0xFFFF) / 16.0f, offy = (float)(ge.offsety & 0xFFFF) / 16.0f;
++    float m[16];
++    tnl_mvp(m);
++    float ctr[4], d[3][4];
++    const float cx = (float)(0.5 * (lo[0] + hi[0])), cy = (float)(0.5 * (lo[1] + hi[1])), cz = (float)(0.5 * (lo[2] + hi[2]));
++    const float h[3] = { (float)(0.5 * (hi[0] - lo[0])), (float)(0.5 * (hi[1] - lo[1])), (float)(0.5 * (hi[2] - lo[2])) };
++    for (int a = 0; a < 4; a++) {
++        ctr[a] = m[a] * cx + m[4 + a] * cy + m[8 + a] * cz + m[12 + a];
++        for (int k = 0; k < 3; k++) d[k][a] = m[4 * k + a] * h[k];
++    }
++    float bx0 = HUGE_VALF, by0 = HUGE_VALF, bx1 = -HUGE_VALF, by1 = -HUGE_VALF;
++    for (int k = 0; k < 8; k++) {
++        float c[4];
++        for (int a = 0; a < 4; a++)
++            c[a] = ctr[a] + ((k & 1) ? d[0][a] : -d[0][a]) + ((k & 2) ? d[1][a] : -d[1][a]) + ((k & 4) ? d[2][a] : -d[2][a]);
++        /* compared in homogeneous space (w > 0 by the first test: each bound times w), one reciprocal for the box */
++        const float w = c[3];
++        if (!(w >= 1e-2f) || !(c[2] + w >= 1e-3f * w) || !(fabsf(c[2]) <= 0.999f * w))
++            return 0;
++        const float X = c[0] * vxs + vxc * w, Y = c[1] * vys + vyc * w;
++        if (!(X >= 8.0f * w && X <= 4088.0f * w && Y >= 8.0f * w && Y <= 4088.0f * w)) return 0;
++        if (!ge.depth_clip) {
++            const float Z = c[2] * vzs + vzc * w;
++            if (!(Z >= 8.0f * w && Z <= 65528.0f * w)) return 0;
++        }
++        const float iw = 1.0f / w, sx = X * iw, sy = Y * iw;
++        bx0 = fminf(bx0, sx - offx); bx1 = fmaxf(bx1, sx - offx);
++        by0 = fminf(by0, sy - offy); by1 = fmaxf(by1, sy - offy);
++    }
++    box[0] = bx0 - 1.0f; box[1] = by0 - 1.0f;
++    box[2] = bx1 + 1.0f; box[3] = by1 + 1.0f;
++    return 1;
++}
++#else
+ static int tnl_corners_ok(const double lo[3], const double hi[3], float box[4]) {
+     const double vxs = decode_float24(ge.viewport_raw[0]), vys = decode_float24(ge.viewport_raw[1]);
+     const double vzs = decode_float24(ge.viewport_raw[2]), vxc = decode_float24(ge.viewport_raw[3]);
+@@ -5282,6 +5475,7 @@ static int tnl_corners_ok(const double lo[3], const double hi[3], float box[4])
+     box[2] = (float)(bx1 + 1.0); box[3] = (float)(by1 + 1.0);
+     return 1;
+ }
++#endif
+ 
+ static int tnl_grow(void **buf, uint32_t *cap, uint32_t need, size_t elem) {
+     if (need <= *cap) return 1;
+@@ -5298,6 +5492,16 @@ static int tnl_grow(void **buf, uint32_t *cap, uint32_t need, size_t elem) {
+  * transform_model_vtx_clip and light_vertex derive it. */
+ static void tnl_params(const VFmt *vf, GeTnlParams *p) {
+     memset(p, 0, sizeof(*p));
++    /* texgen: the shader's (projection and environment mapping) */
++    memcpy(p->tgen, ge.tgen, sizeof(p->tgen));
++    p->texmap = (ge.tex_map_mode & 3u) | (((ge.tex_map_mode >> 8) & 3u) << 8);
++    for (int li = 0; li < 2; li++) {
++        const int l = (int)((ge.tex_shade_ls >> (li * 8)) & 3);
++        float lx = ge.light_pos[l][0], ly = ge.light_pos[l][1], lz = ge.light_pos[l][2];
++        const float ld = sqrtf(lx * lx + ly * ly + lz * lz);
++        if (ld > 0.0f) { lx /= ld; ly /= ld; lz /= ld; }
++        p->env[li * 3 + 0] = lx; p->env[li * 3 + 1] = ly; p->env[li * 3 + 2] = lz;
++    }
+     memcpy(p->world, ge.world, sizeof(p->world));
+     memcpy(p->view, ge.view, sizeof(p->view));
+     memcpy(p->proj, ge.proj, sizeof(p->proj));
+@@ -5305,6 +5509,8 @@ static void tnl_params(const VFmt *vf, GeTnlParams *p) {
+     for (int i = 0; i < 6; i++) p->vp[i] = decode_float24(ge.viewport_raw[i]);
+     p->off[0] = (float)(ge.offsetx & 0xFFFF) / 16.0f;
+     p->off[1] = (float)(ge.offsety & 0xFFFF) / 16.0f;
++    p->cull = ge.depth_clip ? 1u : 0u;
++    p->nan_bits = 0x7FC00000u;
+     p->tex[0] = ge.tex_scale_u; p->tex[1] = ge.tex_scale_v;
+     p->tex[2] = ge.tex_off_u;   p->tex[3] = ge.tex_off_v;
+     p->tex[4] = (float)ge.tex_w; p->tex[5] = (float)ge.tex_h;
+@@ -5357,6 +5563,391 @@ static void tnl_params(const VFmt *vf, GeTnlParams *p) {
+     }
+ }
+ 
++#ifdef SR_GE_NATIVE
++/* Every transform-mode triangle PRIM goes to the GPU, which transforms, lights, clips and
++ * rasterizes it (psp_tnl.vert hands it true clip coordinates). ge.c decides only what a GPU can't: the PSP's triangle drops. When
++ * the PRIM's bound fails the corner test, each vertex's position is transformed (skinned) once through one matrix and a triangle
++ * is left out when a vertex is past the guard band or non-finite, when all are behind the eye, outside the depth range (depth
++ * clip off: any; on: all on one side), or in front with one at w <= NEAR_W (PPSSPP Clipper::ProcessTriangle, as
++ * draw_prim_xform_triangles decides); one crossing the near plane is the GPU's to clip. No CPU transform, lighting, clipping or
++ * rasterizing, and no CPU path: a PRIM the backend can't take is said once, loudly.
++ * The vertices handed over are the range the indices name, as the guest stored them (indices relative to its first vertex): no
++ * per-reference map. Decoded records only for a morphing PRIM or a range not in one host span. */
++enum { TV_NF = 1, TV_OOR = 2, TV_ZP = 4, TV_ZN = 8, TV_WNEG = 16, TV_BEHIND = 32, TV_WLOW = 64 };
++
++static inline void tnl_raw_pos(const uint8_t *p, int fmt, float o[3]) {
++    if (fmt == 3) { memcpy(o, p, 12); return; }
++    if (fmt == 2) { int16_t q[3]; memcpy(q, p, 6); for (int k = 0; k < 3; k++) o[k] = q[k] * (1.0f / 32768.0f); return; }
++    for (int k = 0; k < 3; k++) o[k] = (float)((const int8_t *)p)[k] * (1.0f / 128.0f);
++}
++static inline void tnl_raw_weights(const uint8_t *p, int fmt, int n, float w[8]) {
++    if (fmt == 3) { memcpy(w, p, 4u * (uint32_t)n); return; }
++    if (fmt == 2) { uint16_t q[8]; memcpy(q, p, 2u * (uint32_t)n); for (int k = 0; k < n; k++) w[k] = q[k] * (1.0f / 32768.0f); return; }
++    for (int k = 0; k < n; k++) w[k] = p[k] * (1.0f / 128.0f);
++}
++/* a model position's PSP acceptance flags (transform_model_vtx_clip's), skinned by w when the format has weights */
++static uint8_t tnl_vertex_flags(const float m[16], const float vp[6], const float p[3], const float *w, int wn) {
++    float x = p[0], y = p[1], z = p[2];
++    if (wn) {
++        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
++        for (int b = 0; b < wn; b++) {
++            const float *bm = ge.bone + 12 * b;
++            sx += w[b] * (bm[0] * p[0] + bm[3] * p[1] + bm[6] * p[2] + bm[9]);
++            sy += w[b] * (bm[1] * p[0] + bm[4] * p[1] + bm[7] * p[2] + bm[10]);
++            sz += w[b] * (bm[2] * p[0] + bm[5] * p[1] + bm[8] * p[2] + bm[11]);
++        }
++        x = sx; y = sy; z = sz;
++    }
++    const float cx = m[0] * x + m[4] * y + m[8] * z + m[12], cy = m[1] * x + m[5] * y + m[9] * z + m[13];
++    const float cz = m[2] * x + m[6] * y + m[10] * z + m[14], cw = m[3] * x + m[7] * y + m[11] * z + m[15];
++    uint8_t f = 0;
++    if (!(isfinite(cx) && isfinite(cy) && isfinite(cz) && isfinite(cw))) return TV_NF;
++    const float iw = 1.0f / cw;   /* one reciprocal, not four divisions */
++    const float zw = cz * iw;
++    if (zw >= 1.000030517578125f) f |= TV_ZP;
++    else if (-zw >= 1.000030517578125f) f |= TV_ZN;
++    const float sx = cx * vp[0] * iw + vp[3], sy = cy * vp[1] * iw + vp[4], sz = cz * vp[2] * iw + vp[5];
++    if (!(isfinite(sx) && isfinite(sy) && isfinite(sz))) f |= TV_NF;
++    const float SB = 4095.0f + 15.5f / 16.0f;
++    if (ge.depth_clip) {
++        if (cz > -cw && (sx >= SB || sy >= SB || sx < 0.0f || sy < 0.0f)) f |= TV_OOR;
++    } else if (sx > SB || sy >= SB || sx < 0.0f || sy < 0.0f || sz < 0.0f || sz >= 65536.0f) {
++        f |= TV_OOR;
++    }
++    if (cw < 0.0f) f |= TV_WNEG;
++    if (cz + cw < 0.0f) f |= TV_BEHIND;
++    if (!(cw > NEAR_W)) f |= TV_WLOW;
++    return f;
++}
++/* a triangle the PSP leaves out, from its vertices' flags: any (f) and all (g) */
++static int tnl_triangle_dropped(unsigned f, unsigned g) {
++    if (f & (TV_NF | TV_OOR)) return 1;
++    if (g & TV_WNEG) return 1;
++    if (!ge.depth_clip && (f & (TV_ZP | TV_ZN))) return 1;
++    if ((g & TV_ZP) || (g & TV_ZN)) return 1;
++    if (!(f & TV_BEHIND)) return (f & TV_WLOW) != 0;
++    return (g & TV_BEHIND) != 0;
++}
++
++/* the T&L records' ids, from one counter: a moved copy of a record gets its own */
++static uint32_t tnl_next_params_id(void) {
++    static uint32_t ids;
++    if (++ids == 0u) ids = 1u;
++    return ids;
++}
++/* the record: built again only when the GE state, the vertex type or the vertex source changed (here
++ * for ge_tnl_try_prim and ge_tnl_try_patch alike: raw_mode 0, the GeTnlVtx records ge.c decoded) */
++static GeTnlParams s_params;
++static uint32_t s_params_serial = 0xFFFFFFFFu, s_params_vtype, s_params_id;
++static int s_params_raw = -1;
++static GeTnlParams *tnl_params_current(const VFmt *vf, int raw_mode, int wn, uint32_t stride) {
++    GeTnlParams *const pp = &s_params;
++    if (s_params_serial != s_ge_state_serial || s_params_vtype != ge.vtype || s_params_raw != raw_mode) {
++    GeTnlParams params;
++    tnl_params(vf, &params);
++    {
++        const uint32_t K = 0xFFu;
++        uint32_t po, no, to, co, pf, nf, tf, cf, wo, wf, wnn, st;
++        if (raw_mode) {
++            po = (uint32_t)vf->pos_off; pf = (uint32_t)vf->pos_fmt;
++            no = vf->nrm_off >= 0 ? (uint32_t)vf->nrm_off : K; nf = (uint32_t)vf->nrm_fmt;
++            to = vf->tc_off >= 0 ? (uint32_t)vf->tc_off : K;   tf = (uint32_t)vf->tc_fmt;
++            co = vf->col_off >= 0 ? (uint32_t)vf->col_off : K; cf = (uint32_t)vf->col_fmt;
++            wo = wn ? (uint32_t)vf->w_off : 0u; wf = (uint32_t)vf->w_fmt; wnn = (uint32_t)wn;
++            st = stride;
++        } else {
++            po = (uint32_t)offsetof(GeTnlVtx, x); pf = 3u; no = (uint32_t)offsetof(GeTnlVtx, nx); nf = 3u;
++            to = (uint32_t)offsetof(GeTnlVtx, u); tf = 3u; co = (uint32_t)offsetof(GeTnlVtx, rgba); cf = 7u;
++            wo = (uint32_t)offsetof(GeTnlVtx, w); wf = 3u; wnn = (uint32_t)wn; st = (uint32_t)sizeof(GeTnlVtx);
++        }
++        params.vfmt[0] = (po & K) | ((no & K) << 8) | ((to & K) << 16) | ((co & K) << 24);
++        params.vfmt[1] = (pf & 15u) | ((nf & 15u) << 4) | ((tf & 15u) << 8) | ((cf & 15u) << 12) | ((wf & 15u) << 16) | ((wnn & 15u) << 20);
++        params.vfmt[2] = (wo & K) | ((st & 0xFFFFu) << 8);
++        uint32_t ar = 255, ag = 255, ab = 255, aa = 255;
++        if (ge.material_set || ge.material_alpha_set) {
++            if (ge.material_set) { ar = ge.material & 0xFF; ag = (ge.material >> 8) & 0xFF; ab = (ge.material >> 16) & 0xFF; }
++            if (ge.material_alpha_set) aa = (uint32_t)ge.material_alpha & 0xFF;
++        }
++        params.absent_color = ar | (ag << 8) | (ab << 16) | (aa << 24);
++    }
++    s_params_serial = s_ge_state_serial;
++    s_params_vtype = ge.vtype;
++    s_params_raw = raw_mode;
++    /* a new id only for a record that differs: the renderer then reuses what it staged without comparing */
++    if (s_params_id == 0u || memcmp(pp, &params, sizeof params) != 0) {
++        *pp = params;
++        s_params_id = tnl_next_params_id();
++    }
++    }
++    return pp;
++}
++
++#ifdef SR_GE_NATIVE
++/* the module's hook (ge_gpu.c's, which calls it for 2D sprites and triangles); tnl: a 2D T&L PRIM, its uv unknown */
++typedef struct { uint32_t tex_addr; int tex_enable; int through; float x0, y0, x1, y1; float dy; int skip;
++                 float u0, v0, u1, v1; int tex_w, tex_h; int extend; int tnl; } SdkSpriteDraw;
++void sdk_sprite_draw(SdkSpriteDraw *d) __attribute__((weak));
++#endif
++
++static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase, uint32_t ibase, int idxfmt) {
++    if (!s_gpu || !s_gpu->tnl_prim || !tnl_enabled() || count < 3 || s_wide_d) return 0;
++    if (!tnl_state_ok(type, vf)) { s_tnl_cpu++; return 0; }
++    static uint32_t *s_tnl_ref, *s_tnl_off;
++    static uint8_t *s_tnl_vfl;
++    static uint32_t s_tnl_ref_cap, s_tnl_off_cap, s_tnl_vfl_cap;
++    const uint32_t ntri = type == 3 ? (uint32_t)(count / 3) : (uint32_t)(count - 2);
++    if (!tnl_grow((void **)&s_tnl_ref, &s_tnl_ref_cap, (uint32_t)count, sizeof(uint32_t)) ||
++        !tnl_grow((void **)&s_tnl_tri, &s_tnl_tri_cap, ntri * 3u, sizeof(uint32_t))) {
++        fprintf(stderr, "ge: GPU T&L: out of memory for a PRIM of %d vertices\n", count);
++        return 1;
++    }
++    /* 1. the vertex range the references name, each reference relative to its first vertex */
++    uint32_t minv = 0, maxv = (uint32_t)count - 1u;
++    if (idxfmt) {
++        const uint8_t *ip = idxfmt == 1 || idxfmt == 2 ? ge_ram_span(ibase, (uint32_t)count << (idxfmt - 1)) : NULL;
++        minv = UINT32_MAX;
++        maxv = 0;
++        for (int i = 0; i < count; i++) {
++            uint32_t vi;
++            if (ip && idxfmt == 1) vi = ip[i];
++            else if (ip) { uint16_t v16; memcpy(&v16, ip + 2 * i, 2); vi = v16; }
++            else vi = index_value(ibase, idxfmt, i) & 0xFFFFu;
++            s_tnl_ref[i] = vi;
++            if (vi < minv) minv = vi;
++            if (vi > maxv) maxv = vi;
++        }
++        for (int i = 0; i < count; i++) s_tnl_ref[i] -= minv;
++    } else {
++        for (int i = 0; i < count; i++) s_tnl_ref[i] = (uint32_t)i;
++    }
++    const uint32_t nv = maxv - minv + 1u, stride = (uint32_t)vf->stride;
++    if (!tnl_grow((void **)&s_tnl_off, &s_tnl_off_cap, nv, sizeof(uint32_t)) ||
++        !tnl_grow((void **)&s_tnl_vfl, &s_tnl_vfl_cap, nv, 1u) ||
++        !tnl_grow((void **)&s_tnl_refs, &s_tnl_refs_cap, nv, sizeof(GeTnlVtx))) {
++        fprintf(stderr, "ge: GPU T&L: out of memory for a PRIM of %u vertices\n", nv);
++        return 1;
++    }
++    /* 2. the bytes: the guest's own (one host span, RAM or the plain VRAM view), or records decoded here (a morphing PRIM, a
++     *    range that isn't one span) */
++    const uint32_t va0 = vbase + minv * stride;
++    const uint8_t *vb = NULL;
++    if (vf->morph_n <= 1) {
++        vb = ge_ram_span(va0, nv * stride);
++        if (!vb) {
++            const uint32_t vo = SR_PHYS(va0) - 0x04000000u;
++            if (vo < 0x00200000u && vo + nv * stride <= 0x00200000u) vb = SR_HOST_LINEAR(va0);
++        }
++    }
++    const int raw_mode = vb != NULL;
++    if (!raw_mode) {
++        for (uint32_t u = 0; u < nv; u++) {
++            GeTnlVtx *o = &s_tnl_refs[u];
++            memset(o, 0, sizeof(*o));
++            const uint32_t a = va0 + u * stride;
++            int r, g, b, al;
++            vtx_linear_begin(a, vf);
++            read_pos(a, vf, &o->x, &o->y, &o->z);
++            read_nrm(a, vf, &o->nx, &o->ny, &o->nz);
++            read_tc(a, vf, &o->u, &o->v);
++            read_color(a, vf, &r, &g, &b, &al);
++            o->rgba = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) | ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(al & 0xFF) << 24);
++            if (vf->w_n) read_weights(a, vf, o->w);
++            vtx_linear_end();
++        }
++    }
++    /* 3-4. The PSP's triangle drops are psp_tnl.vert's, vertex by vertex, as PPSSPP's
++     *      hardware T&L decides them (a vertex the PSP leaves out is NaN there and the GPU drops every triangle it is in; one wholly
++     *      behind the eye, beyond the depth range or at w < 0 the GPU clips away): no bound of the positions and weights, no corner
++     *      test and no flags per vertex here. The PRIM's pixels: within the scissor. */
++    const int wn = vf->w_n;
++    float box[4] = { (float)ge.scis_x1 - 1.0f, (float)ge.scis_y1 - 1.0f, (float)ge.scis_x2 + 2.0f, (float)ge.scis_y2 + 2.0f };
++    /* 5. the triangles, in the order draw_prim submits them; a flat PRIM's PSP colour vertex (its last) first, the winding kept
++     *    (one loop per primitive type, no drop test) */
++    uint32_t n = 0;
++    {
++        const int flat = !ge.shade_gouraud;
++        const int cull_on = ge.cull_enable != 0, cull_ccw = (ge.cull & 1) == 0;
++        const uint32_t *ref = s_tnl_ref;
++        uint32_t *out = s_tnl_tri;
++#define TNL_EMIT(A, B, C, FLIP) do { uint32_t a_ = (A), b_ = (B); const uint32_t c_ = (C); \
++            if (FLIP) { const uint32_t t_ = a_; a_ = b_; b_ = t_; } \
++            if (flat) { out[n] = c_; out[n + 1] = a_; out[n + 2] = b_; } else { out[n] = a_; out[n + 1] = b_; out[n + 2] = c_; } \
++            n += 3u; } while (0)
++        if (type == 3) {
++            const int flip = cull_on && cull_ccw;
++            for (int i = 2; i < count; i += 3) TNL_EMIT(ref[i - 2], ref[i - 1], ref[i], flip);
++        } else if (type == 4) {
++            for (int i = 2; i < count; i++) TNL_EMIT(ref[i - 2], ref[i - 1], ref[i], cull_on && (cull_ccw ^ (i & 1)));
++        } else {
++            const int flip = cull_on && cull_ccw;
++            for (int i = 2; i < count; i++) TNL_EMIT(ref[0], ref[i - 1], ref[i], flip);
++        }
++#undef TNL_EMIT
++    }
++    if (n == 0) return 1;   /* every triangle dropped: the PSP draws nothing either */
++    /* raster_tri prepares the depth surface before every triangle it hands the backend. */
++    if (ge.ztest_enable && !ge_zbuf_prepare_current()) return 1;
++    const uint8_t *raw;
++    uint32_t raw_bytes, vstride;   /* the vertices' offsets by their stride, no array of them */
++    if (raw_mode) {
++        raw = vb;
++        raw_bytes = nv * stride;
++        vstride = stride;
++    } else {
++        raw = (const uint8_t *)s_tnl_refs;
++        raw_bytes = nv * (uint32_t)sizeof(GeTnlVtx);
++        vstride = (uint32_t)sizeof(GeTnlVtx);
++    }
++    GeTnlParams *const pp = tnl_params_current(vf, raw_mode, wn, stride);
++#ifdef SR_GE_NATIVE
++    /* the module's say over a 2D T&L PRIM (an orthographic projection, no skinning: a menu's panel or
++     * text, a HUD's flash), as over a through-mode sprite: its pixels' box from its vertices here; dropped, or moved down by dy rows
++     * (the record's screen offset, in a copy with its own id) */
++    const GeTnlParams *use_pp = pp;
++    uint32_t use_id = s_params_id;
++    if (sdk_sprite_draw && !wn && nv <= 4096u && pp->proj[3] == 0.0f && pp->proj[7] == 0.0f && pp->proj[11] == 0.0f && pp->proj[15] != 0.0f) {
++        float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
++        const float *W = pp->world, *V = pp->view, *P = pp->proj;
++        for (uint32_t u = 0; u < nv; u++) {
++            float m[3];
++            if (raw_mode) {
++                const uint8_t *q = vb + u * stride + vf->pos_off;
++                if (vf->pos_fmt == 3) memcpy(m, q, 12);
++                else if (vf->pos_fmt == 2) { int16_t t[3]; memcpy(t, q, 6); for (int k = 0; k < 3; k++) m[k] = t[k] * (1.0f / 32768.0f); }
++                else { const int8_t *t = (const int8_t *)q; for (int k = 0; k < 3; k++) m[k] = t[k] * (1.0f / 128.0f); }
++            } else {
++                m[0] = s_tnl_refs[u].x; m[1] = s_tnl_refs[u].y; m[2] = s_tnl_refs[u].z;
++            }
++            float w3[3], v3[3];
++            for (int r = 0; r < 3; r++) w3[r] = W[r] * m[0] + W[3 + r] * m[1] + W[6 + r] * m[2] + W[9 + r];
++            for (int r = 0; r < 3; r++) v3[r] = V[r] * w3[0] + V[3 + r] * w3[1] + V[6 + r] * w3[2] + V[9 + r];
++            const float cx = P[0] * v3[0] + P[4] * v3[1] + P[8] * v3[2] + P[12];
++            const float cy = P[1] * v3[0] + P[5] * v3[1] + P[9] * v3[2] + P[13];
++            const float sx = cx / P[15] * pp->vp[0] + pp->vp[3] - pp->off[0];
++            const float sy = cy / P[15] * pp->vp[1] + pp->vp[4] - pp->off[1];
++            bx0 = fminf(bx0, sx); bx1 = fmaxf(bx1, sx); by0 = fminf(by0, sy); by1 = fmaxf(by1, sy);
++        }
++        if (bx0 <= bx1 && by0 <= by1) {
++            SdkSpriteDraw d = { ge.tex_addr, ge.tex_enable, 0, bx0, by0, bx1, by1, 0.0f, 0, -1e9f, -1e9f, -1e9f, -1e9f, ge.tex_w, ge.tex_h, 0 };
++            d.tnl = 1;
++            sdk_sprite_draw(&d);
++            if (d.skip) return 1;
++            if (d.dy != 0.0f) {
++                static GeTnlParams s_moved;
++                static uint32_t s_moved_base, s_moved_id;
++                static float s_moved_dy;
++                if (!s_moved_id || s_moved_base != s_params_id || s_moved_dy != d.dy) {
++                    s_moved = *pp;
++                    s_moved.off[1] -= d.dy;
++                    s_moved_base = s_params_id;
++                    s_moved_dy = d.dy;
++                    s_moved_id = tnl_next_params_id();
++                }
++                use_pp = &s_moved;
++                use_id = s_moved_id;
++            }
++        }
++    }
++#else
++    const GeTnlParams *use_pp = pp;
++    const uint32_t use_id = s_params_id;
++#endif
++    /* the backend's limit is 65536 indices a PRIM: a larger one goes in pieces, every piece with the whole vertex range */
++    const uint32_t per = 21840u * 3u;
++    for (uint32_t t0 = 0; t0 < n; t0 += per) {
++        const uint32_t tn = n - t0 < per ? n - t0 : per;
++        GeTnlPrim prim = { use_pp, s_tnl_refs, nv, s_tnl_tri + t0, tn / 3u,
++                           { box[0], box[1], box[2], box[3] }, raw, raw_bytes, NULL, use_id, vstride };
++        uint64_t profile_started = ge_cpu_profile_begin();
++        const int taken = s_gpu->tnl_prim(&prim);
++        ge_cpu_profile_end(GE_CPU_GPU_HOOK, profile_started);
++        if (!taken) {
++            static int said;
++            if (!said++)
++                fprintf(stderr, "ge: GPU T&L: the backend refused a PRIM (%u vertices, %u bytes, %u triangles): not drawn, said once\n",
++                        nv, raw_bytes, tn / 3u);
++            return 1;
++        }
++    }
++    s_tnl_taken++;
++    s_stat.gpuprim += n / 3u;
++    return 1;
++}
++
++/* a BEZIER or SPLINE of triangles through the GPU's T&L: the patches' grid points evaluated once each
++ * (draw_patch evaluated every quad's four corners and sent each triangle down the CPU path) into GeTnlVtx records, the triangles
++ * draw_patch makes (q0 q2 q1, q1 q2 q3 a quad, the cull flip and flat shading's first vertex as draw_prim's), one PRIM (pieces past
++ * the backend's limit). 0: not taken (lines, points, through mode, skinning, morphing, state T&L can't draw): draw_patch's own path */
++static int ge_tnl_try_patch(const VFmt *vf, const ModelVtx *all, int nu, int pu, int pv, int tu, int tv, int spline, int typeu,
++                            int typev) {
++    if (!s_gpu || !s_gpu->tnl_prim || !tnl_enabled() || s_wide_d) return 0;
++    if (vf->through || vf->w_n || vf->morph_n > 1 || !tnl_state_ok(3, vf)) return 0;
++    const uint32_t gw = (uint32_t)tu + 1u, gh = (uint32_t)tv + 1u, per_patch = gw * gh;
++    const uint32_t nvtx = per_patch * (uint32_t)pu * (uint32_t)pv, ntri = 2u * (uint32_t)tu * (uint32_t)tv * (uint32_t)pu * (uint32_t)pv;
++    if (!nvtx || !ntri) return 0;
++    if (!tnl_grow((void **)&s_tnl_refs, &s_tnl_refs_cap, nvtx, sizeof(GeTnlVtx)) ||
++        !tnl_grow((void **)&s_tnl_tri, &s_tnl_tri_cap, ntri * 3u, sizeof(uint32_t)))
++        return 0;
++    const int gen = vf->tc_off < 0;
++    PatchWeight wu[129], wv[129];
++    uint32_t nv = 0, n = 0;
++    const int flat = !ge.shade_gouraud, flip = ge.cull_enable && (ge.cull & 1) == 0;
++    for (int py = 0; py < pv; py++) {
++        for (int y = 0; y <= tv; y++) {
++            if (spline) spline_weight(py, y, tv, pv, typev, &wv[y]);
++            else bezier_weight((float)y / (float)tv, &wv[y]);
++        }
++        for (int px = 0; px < pu; px++) {
++            for (int x = 0; x <= tu; x++) {
++                if (spline) spline_weight(px, x, tu, pu, typeu, &wu[x]);
++                else bezier_weight((float)x / (float)tu, &wu[x]);
++            }
++            const int base = (spline ? py : py * 3) * nu + (spline ? px : px * 3);
++            const uint32_t first = nv;
++            for (int y = 0; y <= tv; y++)
++                for (int x = 0; x <= tu; x++) {
++                    ModelVtx m;
++                    patch_eval(all + base, nu, &wu[x], &wv[y], gen, (float)px + (float)x / (float)tu, (float)py + (float)y / (float)tv, &m);
++                    if (!(isfinite(m.x) && isfinite(m.y) && isfinite(m.z))) return 0;   /* draw_patch's path refuses it there */
++                    GeTnlVtx *o = &s_tnl_refs[nv++];
++                    memset(o, 0, sizeof(*o));
++                    o->x = m.x; o->y = m.y; o->z = m.z; o->nx = m.nx; o->ny = m.ny; o->nz = m.nz; o->u = m.u; o->v = m.v;
++                    o->rgba = (uint32_t)(m.r & 0xFF) | ((uint32_t)(m.g & 0xFF) << 8) | ((uint32_t)(m.b & 0xFF) << 16) |
++                              ((uint32_t)(m.a & 0xFF) << 24);
++                }
++            uint32_t *out = s_tnl_tri;
++#define PATCH_TRI(A, B, C) do { uint32_t a_ = (A), b_ = (B); const uint32_t c_ = (C); \
++                if (flip) { const uint32_t t_ = a_; a_ = b_; b_ = t_; } \
++                if (flat) { out[n] = c_; out[n + 1] = a_; out[n + 2] = b_; } else { out[n] = a_; out[n + 1] = b_; out[n + 2] = c_; } \
++                n += 3u; } while (0)
++            for (int y = 0; y < tv; y++)
++                for (int x = 0; x < tu; x++) {
++                    const uint32_t q0 = first + (uint32_t)y * gw + (uint32_t)x, q1 = q0 + 1u, q2 = q0 + gw, q3 = q2 + 1u;
++                    PATCH_TRI(q0, q2, q1);
++                    PATCH_TRI(q1, q2, q3);
++                }
++#undef PATCH_TRI
++        }
++    }
++    GeTnlParams *const pp = tnl_params_current(vf, 0, 0, 0);
++    float box[4] = { (float)ge.scis_x1 - 1.0f, (float)ge.scis_y1 - 1.0f, (float)ge.scis_x2 + 2.0f, (float)ge.scis_y2 + 2.0f };
++    const uint32_t per = 21840u * 3u;
++    for (uint32_t t0 = 0; t0 < n; t0 += per) {
++        const uint32_t tn = n - t0 < per ? n - t0 : per;
++        GeTnlPrim prim = { pp, s_tnl_refs, nv, s_tnl_tri + t0, tn / 3u, { box[0], box[1], box[2], box[3] },
++                           (const uint8_t *)s_tnl_refs, nv * (uint32_t)sizeof(GeTnlVtx), NULL, s_params_id, (uint32_t)sizeof(GeTnlVtx) };
++        if (!s_gpu->tnl_prim(&prim)) {
++            static int said;
++            if (!said++)
++                fprintf(stderr, "ge: GPU T&L: the backend refused a patch (%u vertices, %u triangles): not drawn, said once\n", nv, tn / 3u);
++            return 1;
++        }
++    }
++    s_tnl_taken++;
++    s_stat.gpuprim += n / 3u;
++    return 1;
++}
++#else
+ /* Offer the PRIM to the backend. Returns 1 when the backend drew it (or, as raster_tri would
+  * for every triangle, the depth surface could not be prepared), 0 to run the CPU path. */
+ static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase, uint32_t ibase,
+@@ -5370,23 +5961,144 @@ static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase,
+         s_tnl_cpu++;
+         return 0;
+     }
++    /* an indexed PRIM decodes each vertex it names once, however many triangles share it:
++     * s_tnl_slot maps each reference to its decoded vertex, the triangles below take their indices through it. */
++    static uint32_t *s_tnl_slot;
++    static uint32_t s_tnl_slot_cap;
++    /* each decoded vertex's index in the vertex buffer, and its byte offset in the raw bytes handed over */
++    static uint32_t *s_tnl_vi, *s_tnl_off;
++    static uint32_t s_tnl_vi_cap, s_tnl_off_cap;
++    /* the GPU decodes the vertices from their raw bytes (psp_tnl.vert); the CPU reads only positions and
++     * weights, for the bound and the PSP's acceptance test. A morphing PRIM keeps the CPU's decode, handed as GeTnlVtx records. */
++    const int raw_mode = vf->morph_n <= 1;
++    if (!tnl_grow((void **)&s_tnl_vi, &s_tnl_vi_cap, (uint32_t)count, sizeof(uint32_t)) ||
++        !tnl_grow((void **)&s_tnl_off, &s_tnl_off_cap, (uint32_t)count, sizeof(uint32_t))) { s_tnl_cpu++; return 0; }
++    static int32_t s_tnl_map[65536];
++    static uint32_t s_tnl_map_gen[65536];
++    static uint32_t s_tnl_gen;
++    if (!tnl_grow((void **)&s_tnl_slot, &s_tnl_slot_cap, (uint32_t)count, sizeof(uint32_t))) { s_tnl_cpu++; return 0; }
++    if (++s_tnl_gen == 0u) { memset(s_tnl_map_gen, 0, sizeof(s_tnl_map_gen)); s_tnl_gen = 1u; }
++    uint32_t nunique = 0;
+     /* Decode every reference once (with morphing, without skinning) and bound the positions. */
+     double lo[3] = { HUGE_VAL, HUGE_VAL, HUGE_VAL }, hi[3] = { -HUGE_VAL, -HUGE_VAL, -HUGE_VAL };
+     double wlo[GE_TNL_MAX_WEIGHTS], whi[GE_TNL_MAX_WEIGHTS];
+     for (int i = 0; i < GE_TNL_MAX_WEIGHTS; i++) { wlo[i] = HUGE_VAL; whi[i] = -HUGE_VAL; }
+     int lit = ge.lighting_enable && !ge_env_nolight();
++#ifdef SR_GE_NATIVE
++    /* A PRIM the GPU decodes from its raw bytes: the references (each vertex once), then
++     * the unique vertices' positions and weights read straight from host memory, a loop per format, bounds kept in integers for
++     * the fixed-point formats. No accessor per component, no decoded record per vertex: the GPU decodes them. */
++    if (raw_mode) {
++        uint32_t minv = UINT32_MAX, maxv = 0;
++        if (!idxfmt) {
++            for (int i = 0; i < count; i++) { s_tnl_slot[i] = (uint32_t)i; s_tnl_vi[i] = (uint32_t)i; }
++            nunique = (uint32_t)count; minv = 0; maxv = (uint32_t)count - 1u;
++        } else {
++            const uint8_t *ip = idxfmt == 1 || idxfmt == 2 ? ge_ram_span(ibase, (uint32_t)count << (idxfmt - 1)) : NULL;
++            for (int i = 0; i < count; i++) {
++                uint32_t vi;
++                if (ip && idxfmt == 1) vi = ip[i];
++                else if (ip) { uint16_t v16; memcpy(&v16, ip + 2 * i, 2); vi = v16; }
++                else vi = index_value(ibase, idxfmt, i) & 0xFFFFu;
++                if (s_tnl_map_gen[vi] == s_tnl_gen) { s_tnl_slot[i] = (uint32_t)s_tnl_map[vi]; continue; }
++                s_tnl_map_gen[vi] = s_tnl_gen;
++                s_tnl_map[vi] = (int32_t)nunique;
++                s_tnl_slot[i] = nunique;
++                s_tnl_vi[nunique++] = vi;
++                if (vi < minv) minv = vi;
++                if (vi > maxv) maxv = vi;
++            }
++        }
++        const uint32_t stride = (uint32_t)vf->stride;
++        const uint32_t va0 = vbase + minv * stride, vspan = (maxv - minv + 1u) * stride;
++        const uint8_t *vb = ge_ram_span(va0, vspan);
++        if (!vb) {
++            const uint32_t vo = SR_PHYS(va0) - 0x04000000u;
++            if (vo < 0x00200000u && vo + vspan <= 0x00200000u) vb = SR_HOST_LINEAR(va0);
++        }
++        if (!vb) { s_tnl_cpu++; return 0; }
++        const uint8_t *pb = vb + vf->pos_off;
++        if (vf->pos_fmt == 3) {
++            float fl[3] = { HUGE_VALF, HUGE_VALF, HUGE_VALF }, fh[3] = { -HUGE_VALF, -HUGE_VALF, -HUGE_VALF };
++            for (uint32_t u = 0; u < nunique; u++) {
++                float q[3];
++                memcpy(q, pb + (s_tnl_vi[u] - minv) * stride, 12);
++                for (int k = 0; k < 3; k++) { fl[k] = q[k] < fl[k] ? q[k] : fl[k]; fh[k] = q[k] > fh[k] ? q[k] : fh[k]; }
++            }
++            for (int k = 0; k < 3; k++) { lo[k] = fl[k]; hi[k] = fh[k]; }
++        } else if (vf->pos_fmt == 2) {
++            int il[3] = { 32767, 32767, 32767 }, ih[3] = { -32768, -32768, -32768 };
++            for (uint32_t u = 0; u < nunique; u++) {
++                int16_t q[3];
++                memcpy(q, pb + (s_tnl_vi[u] - minv) * stride, 6);
++                for (int k = 0; k < 3; k++) { il[k] = q[k] < il[k] ? q[k] : il[k]; ih[k] = q[k] > ih[k] ? q[k] : ih[k]; }
++            }
++            for (int k = 0; k < 3; k++) { lo[k] = il[k] * (1.0 / 32768.0); hi[k] = ih[k] * (1.0 / 32768.0); }
++        } else {
++            int il[3] = { 127, 127, 127 }, ih[3] = { -128, -128, -128 };
++            for (uint32_t u = 0; u < nunique; u++) {
++                const int8_t *q = (const int8_t *)(pb + (s_tnl_vi[u] - minv) * stride);
++                for (int k = 0; k < 3; k++) { il[k] = q[k] < il[k] ? q[k] : il[k]; ih[k] = q[k] > ih[k] ? q[k] : ih[k]; }
++            }
++            for (int k = 0; k < 3; k++) { lo[k] = il[k] * (1.0 / 128.0); hi[k] = ih[k] * (1.0 / 128.0); }
++        }
++        if (vf->w_n) {
++            const uint8_t *wb = vb + vf->w_off;
++            const int wn = vf->w_n;
++            if (vf->w_fmt == 3) {
++                for (uint32_t u = 0; u < nunique; u++) {
++                    float q[8];
++                    memcpy(q, wb + (s_tnl_vi[u] - minv) * stride, 4u * (uint32_t)wn);
++                    for (int k = 0; k < wn; k++) { if (q[k] < wlo[k]) wlo[k] = q[k]; if (q[k] > whi[k]) whi[k] = q[k]; }
++                }
++            } else {
++                int il[8], ih[8];
++                for (int k = 0; k < wn; k++) { il[k] = 65535; ih[k] = 0; }
++                if (vf->w_fmt == 2) {
++                    for (uint32_t u = 0; u < nunique; u++) {
++                        uint16_t q[8];
++                        memcpy(q, wb + (s_tnl_vi[u] - minv) * stride, 2u * (uint32_t)wn);
++                        for (int k = 0; k < wn; k++) { il[k] = q[k] < il[k] ? q[k] : il[k]; ih[k] = q[k] > ih[k] ? q[k] : ih[k]; }
++                    }
++                } else {
++                    for (uint32_t u = 0; u < nunique; u++) {
++                        const uint8_t *q = wb + (s_tnl_vi[u] - minv) * stride;
++                        for (int k = 0; k < wn; k++) { il[k] = q[k] < il[k] ? q[k] : il[k]; ih[k] = q[k] > ih[k] ? q[k] : ih[k]; }
++                    }
++                }
++                const double sc = vf->w_fmt == 2 ? 1.0 / 32768.0 : 1.0 / 128.0;
++                for (int k = 0; k < wn; k++) { wlo[k] = il[k] * sc; whi[k] = ih[k] * sc; }
++            }
++        }
++    } else
++#endif
+     for (int i = 0; i < count; i++) {
+-        uint32_t a = prim_vtx_addr(vbase, ibase, idxfmt, i, vf->stride);
+-        GeTnlVtx *o = &s_tnl_refs[i];
++        uint32_t a, vix;
++        if (idxfmt) {
++            const uint32_t vi = index_value(ibase, idxfmt, i) & 0xFFFFu;
++            if (s_tnl_map_gen[vi] == s_tnl_gen) { s_tnl_slot[i] = (uint32_t)s_tnl_map[vi]; continue; }
++            s_tnl_map_gen[vi] = s_tnl_gen;
++            s_tnl_map[vi] = (int32_t)nunique;
++            a = vbase + vi * (uint32_t)vf->stride;
++            vix = vi;
++        } else {
++            a = vbase + (uint32_t)i * (uint32_t)vf->stride;
++            vix = (uint32_t)i;
++        }
++        s_tnl_slot[i] = nunique;
++        s_tnl_vi[nunique] = vix;
++        GeTnlVtx *o = &s_tnl_refs[nunique++];
+         memset(o, 0, sizeof(*o));
+-        int r, g, b, al;
+         vtx_linear_begin(a, vf);
+         read_pos(a, vf, &o->x, &o->y, &o->z);
+-        read_nrm(a, vf, &o->nx, &o->ny, &o->nz);
+-        read_tc(a, vf, &o->u, &o->v);
+-        read_color(a, vf, &r, &g, &b, &al);
+-        o->rgba = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
+-                  ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(al & 0xFF) << 24);
++        if (!raw_mode) {
++            int r, g, b, al;
++            read_nrm(a, vf, &o->nx, &o->ny, &o->nz);
++            read_tc(a, vf, &o->u, &o->v);
++            read_color(a, vf, &r, &g, &b, &al);
++            o->rgba = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
++                      ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(al & 0xFF) << 24);
++        }
+         if (vf->w_n) read_weights(a, vf, o->w);
+         vtx_linear_end();
+         float pos[3] = { o->x, o->y, o->z }, nrm[3] = { o->nx, o->ny, o->nz };
+@@ -5427,7 +6139,34 @@ static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase,
+         memcpy(hi, shi, sizeof(hi));
+     }
+     float box[4];
++    /* A PRIM reaching behind the camera or past the guard band keeps ge.c's clipping: psp_tnl.vert divides by w itself and hands
++     * the GPU w = 1, so the GPU can't clip it (handed over, such vertices projected through negative w into spikes across the
++     * screen). Native clipping needs the shader's true clip coordinates first. */
+     if (!tnl_corners_ok(lo, hi, box)) { s_tnl_cpu++; return 0; }
++    /* the bytes handed to the GPU: the guest's vertex range (contiguous host memory, RAM or the plain VRAM view),
++     * or the decoded records */
++    const uint8_t *raw;
++    uint32_t raw_bytes;
++    if (raw_mode) {
++        uint32_t minv = UINT32_MAX, maxv = 0;
++        for (uint32_t u = 0; u < nunique; u++) {
++            if (s_tnl_vi[u] < minv) minv = s_tnl_vi[u];
++            if (s_tnl_vi[u] > maxv) maxv = s_tnl_vi[u];
++        }
++        const uint32_t a0 = vbase + minv * (uint32_t)vf->stride;
++        raw_bytes = (maxv - minv + 1u) * (uint32_t)vf->stride;
++        raw = ge_ram_span(a0, raw_bytes);
++        if (!raw) {
++            const uint32_t vo = SR_PHYS(a0) - 0x04000000u;
++            if (vo < 0x00200000u && vo + raw_bytes <= 0x00200000u) raw = SR_HOST_LINEAR(a0);
++        }
++        if (!raw) { s_tnl_cpu++; return 0; }
++        for (uint32_t u = 0; u < nunique; u++) s_tnl_off[u] = (s_tnl_vi[u] - minv) * (uint32_t)vf->stride;
++    } else {
++        raw = (const uint8_t *)s_tnl_refs;
++        raw_bytes = nunique * (uint32_t)sizeof(GeTnlVtx);
++        for (uint32_t u = 0; u < nunique; u++) s_tnl_off[u] = u * (uint32_t)sizeof(GeTnlVtx);
++    }
+     /* The triangles, in the order draw_prim submits them. */
+     uint32_t n = 0;
+     for (int i = 2; i < count; i++) {
+@@ -5439,16 +6178,42 @@ static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase,
+             int flip = ((ge.cull & 1) == 0) ^ ((type == 4) ? (i & 1) : 0);
+             if (flip) { int t = i0; i0 = i1; i1 = t; }
+         }
+-        s_tnl_tri[n++] = (uint32_t)i0;
+-        s_tnl_tri[n++] = (uint32_t)i1;
+-        s_tnl_tri[n++] = (uint32_t)i2;
++        s_tnl_tri[n++] = s_tnl_slot[i0];
++        s_tnl_tri[n++] = s_tnl_slot[i1];
++        s_tnl_tri[n++] = s_tnl_slot[i2];
+     }
+     /* raster_tri prepares the depth surface before every triangle it hands the backend. */
+     if (ge.ztest_enable && !ge_zbuf_prepare_current()) return 1;
+     GeTnlParams params;
+     tnl_params(vf, &params);
+-    GeTnlPrim prim = { &params, s_tnl_refs, (uint32_t)count, s_tnl_tri, n / 3u,
+-                       { box[0], box[1], box[2], box[3] } };
++    /* the format the shader decodes: the guest's, or GeTnlVtx's (floats, colour 8888, eight float weights) */
++    {
++        const uint32_t K = 0xFFu;
++        uint32_t po, no, to, co, pf, nf, tf, cf, wo, wf, wn, st;
++        if (raw_mode) {
++            po = (uint32_t)vf->pos_off; pf = (uint32_t)vf->pos_fmt;
++            no = vf->nrm_off >= 0 ? (uint32_t)vf->nrm_off : K; nf = (uint32_t)vf->nrm_fmt;
++            to = vf->tc_off >= 0 ? (uint32_t)vf->tc_off : K;   tf = (uint32_t)vf->tc_fmt;
++            co = vf->col_off >= 0 ? (uint32_t)vf->col_off : K; cf = (uint32_t)vf->col_fmt;
++            wo = vf->w_n ? (uint32_t)vf->w_off : 0u; wf = (uint32_t)vf->w_fmt; wn = (uint32_t)vf->w_n;
++            st = (uint32_t)vf->stride;
++        } else {
++            po = (uint32_t)offsetof(GeTnlVtx, x); pf = 3u; no = (uint32_t)offsetof(GeTnlVtx, nx); nf = 3u;
++            to = (uint32_t)offsetof(GeTnlVtx, u); tf = 3u; co = (uint32_t)offsetof(GeTnlVtx, rgba); cf = 7u;
++            wo = (uint32_t)offsetof(GeTnlVtx, w); wf = 3u; wn = (uint32_t)vf->w_n; st = (uint32_t)sizeof(GeTnlVtx);
++        }
++        params.vfmt[0] = (po & K) | ((no & K) << 8) | ((to & K) << 16) | ((co & K) << 24);
++        params.vfmt[1] = (pf & 15u) | ((nf & 15u) << 4) | ((tf & 15u) << 8) | ((cf & 15u) << 12) | ((wf & 15u) << 16) | ((wn & 15u) << 20);
++        params.vfmt[2] = (wo & K) | ((st & 0xFFFFu) << 8);
++        uint32_t ar = 255, ag = 255, ab = 255, aa = 255;
++        if (ge.material_set || ge.material_alpha_set) {
++            if (ge.material_set) { ar = ge.material & 0xFF; ag = (ge.material >> 8) & 0xFF; ab = (ge.material >> 16) & 0xFF; }
++            if (ge.material_alpha_set) aa = (uint32_t)ge.material_alpha & 0xFF;
++        }
++        params.absent_color = ar | (ag << 8) | (ab << 16) | (aa << 24);
++    }
++    GeTnlPrim prim = { &params, s_tnl_refs, nunique, s_tnl_tri, n / 3u,
++                       { box[0], box[1], box[2], box[3] }, raw, raw_bytes, s_tnl_off };
+     uint64_t profile_started = ge_cpu_profile_begin();
+     int taken = s_gpu->tnl_prim(&prim);
+     ge_cpu_profile_end(GE_CPU_GPU_HOOK, profile_started);
+@@ -5457,6 +6222,7 @@ static int ge_tnl_try_prim(int type, int count, const VFmt *vf, uint32_t vbase,
+     s_stat.gpuprim += n / 3u;
+     return 1;
+ }
++#endif
+ 
+ /* When an entire 3D primitive lands behind the near plane (all clip-w <= NEAR_W), dump the raw
+  * model-space position, the resulting w's, and the full matrix state -- distinguishes "camera
+@@ -6151,7 +6917,17 @@ static void draw_prim(uint32_t op, unsigned long prim_index, uint32_t list_addr,
+     int type = (op >> 16) & 7;
+     int count = op & 0xFFFF;
+     draw_prim_note_profile(type, count);
+-    VFmt vf; decode_vtype(ge.vtype, &vf);
++    VFmt vf;
++#ifdef SR_GE_NATIVE
++    {   /* the vertex type decoded once while it is the same */
++        static VFmt s_vf;
++        static uint32_t s_vf_vtype = 0xFFFFFFFFu;
++        if (s_vf_vtype != ge.vtype) { decode_vtype(ge.vtype, &s_vf); s_vf_vtype = ge.vtype; }
++        vf = s_vf;
++    }
++#else
++    decode_vtype(ge.vtype, &vf);
++#endif
+     primitive_profile_note_draw(type, count, &vf);
+     draw_prim_count_list(type, count, &vf);
+ #ifdef SR_GE_FRONTEND_PROFILE
+@@ -6201,7 +6977,16 @@ static void draw_prim(uint32_t op, unsigned long prim_index, uint32_t list_addr,
+      * those reads out of the sparse event population. */
+     s_primitive_profile_counting = 0;
+     primitive_profile_clear_pending();
++#ifdef SR_GE_NATIVE
++    /* the per-PRIM trace (SR_GEMAT, SR_RTRACE, SR_VDUMP, SR_GESTAT, SR_GEWATCH) only when
++     * one is on: a copy of the vertex format and a dozen gates at every PRIM otherwise */
++    static int s_ptrace = -1;
++    if (s_ptrace < 0)
++        s_ptrace = getenv("SR_GEMAT") || getenv("SR_RTRACE") || getenv("SR_VDUMP") || getenv("SR_GESTAT") || getenv("SR_GEWATCH");
++    int rt = s_ptrace ? draw_prim_trace_transform(&c) : 0;
++#else
+     int rt = draw_prim_trace_transform(&c);
++#endif
+ 
+     s_primitive_profile_counting = s_primitive_profile;
+     if (type == 0) {           /* points */
+@@ -6257,6 +7042,9 @@ static void ge_imm_draw(int type, const Vtx *a, const Vtx *b, const Vtx *c, int
+     ge.fog_enable = (flags & GE_IMM_FOG) != 0u;
+     ge.dither_enable = (flags & GE_IMM_DITHER) != 0u;
+     ge.shade_gouraud = (flags & GE_IMM_SHADING) != 0u;
++#ifdef SR_GE_NATIVE
++    s_ge_render_serial++;
++#endif
+     ge_note_mip_draw();
+ 
+     if (type == 0) {
+@@ -6280,6 +7068,9 @@ static void ge_imm_draw(int type, const Vtx *a, const Vtx *b, const Vtx *c, int
+     ge.fog_enable = old_fog;
+     ge.dither_enable = old_dither;
+     ge.shade_gouraud = old_gouraud;
++#ifdef SR_GE_NATIVE
++    s_ge_render_serial++;
++#endif
+     g_frame_prims++;
+     if (type == 6) g_ge_list_through_sprites++;
+ }
+@@ -6450,7 +7241,9 @@ uint32_t ge_run_list_until(uint32_t addr, int resume, atomic_int_least32_t *stop
+     return next;
+ }
+ 
++uint32_t g_ge_run_gen, g_ge_clut_gen;
+ uint32_t ge_run_list(uint32_t addr, int resume) {
++    g_ge_run_gen++;
+     uint64_t perf_started = sr_perf_now_ns();
+     if (!resume) s_ge_finish_id = 0u;   /* a new list has run no FINISH yet */
+     ge_cpu_profile_configure();
+@@ -6911,6 +7704,7 @@ static int ge_cmd_texture(uint32_t cmd, uint32_t data) {
+              * the hardware (PPSSPP TextureCacheCommon::LoadClut). */
+             uint32_t bytes = (data & 0x3F) * 32;
+             if (bytes > sizeof(ge.clutram)) bytes = sizeof(ge.clutram);
++            g_ge_clut_gen++;
+             ge_clut_note_load(bytes);
+             if (!sr_guest_span_readable(ge.clut_addr, bytes)) {
+                 fprintf(stderr, "GE_LOADCLUT: invalid source span addr=0x%08" PRIx32 " bytes=%" PRIu32 "\n",
+@@ -7209,15 +8003,100 @@ static uint32_t ge_run_list_inner(uint32_t addr, int resume) {
+             return addr;
+         }
+         uint32_t op=MEM_R32(addr);
++#ifdef SR_FASTMEM
++        /* the list's next lines on their way (the game wrote them on another core: each command's
++         * word was a cache miss) */
++        __builtin_prefetch(SR_GUEST_VIEW + (uint32_t)(addr + 256u));
++#endif
+         /* A draw observer may stop the run before a draw command: nothing of it has run. */
+         if (s_draw_observer && ge_draw_observed(op, addr, list_addr)) return addr;
+         addr+=4;
+         uint32_t cmd=op>>24, data=op&0xFFFFFF;
++#ifdef SR_GE_NATIVE
++        /* A run of one matrix's data words (bones, world, view, projection, texgen: most
++         * of a fight's ~33,000 commands a frame) in one loop: each word decoded and stored as its handler does (written while the
++         * cursor is in range, the cursor always advanced), the stall address honoured word by word, the command word and the
++         * list's signature kept as the loop below keeps them. */
++        if (cmd == 0x2Bu || cmd == 0x3Bu || cmd == 0x3Du || cmd == 0x3Fu || cmd == 0x41u) {
++            float *mx;
++            int *cur, lim;
++            switch (cmd) {
++                case 0x2Bu: mx = ge.bone;  cur = &ge.bone_num;  lim = 96; break;
++                case 0x3Bu: mx = ge.world; cur = &ge.world_num; lim = 12; break;
++                case 0x3Du: mx = ge.view;  cur = &ge.view_num;  lim = 12; break;
++                case 0x3Fu: mx = ge.proj;  cur = &ge.proj_num;  lim = 16; break;
++                default:    mx = ge.tgen;  cur = &ge.tgen_num;  lim = 12; break;
++            }
++            uint32_t w = op;
++            for (;;) {
++                const uint32_t d = w & 0xFFFFFFu;
++                if (*cur < lim) mx[*cur] = decode_float24(d);
++                (*cur)++;
++                s_ge_command[cmd] = d;
++                g_ge_list_commands++;
++                if (g_ge_stall_addr && (addr & 0x0FFFFFFFu) == (g_ge_stall_addr & 0x0FFFFFFFu)) break;
++                const uint32_t nw = MEM_R32(addr);
++#ifdef SR_FASTMEM
++                if ((addr & 63u) == 0u) __builtin_prefetch(SR_GUEST_VIEW + (uint32_t)(addr + 256u));
++#endif
++                if ((nw >> 24) != cmd) break;
++                w = nw;
++                addr += 4;
++            }
++            s_ge_state_serial++;
++            continue;
++        }
++        /* every command but the ones that only point at or start drawing (vertex and index
++         * addresses, PRIM, base, offsets, flow): the T&L state the caches below hold (light constants, the PRIM record, the
++         * transform) is the same across an object's PRIMs */
++        /* 0x00-0x0F: NOP, VADDR, IADDR, PRIM, BEZIER, SPLINE, BOUNDINGBOX, JUMP, BJUMP, CALL, RET, END, SIGNAL, FINISH */
++        if (!(cmd <= 0x0Fu && ((0xDFF7u >> cmd) & 1u)) && cmd != GE_BASE && cmd != GE_OFFSETADDR && cmd != GE_ORIGIN) {
++            s_ge_state_serial++;
++            /* the renderer's state: every such command but a bone, world, view or projection matrix word (the
++             * renderer has those in the T&L record) */
++            if (!(cmd == 0x2Au || cmd == 0x2Bu || (cmd >= 0x3Au && cmd <= 0x3Fu))) s_ge_render_serial++;
++        }
++#else
+         s_ge_state_serial++;   /* any command may change state that light_consts() caches */
++#endif
+         s_ge_command[cmd] = data;
+         g_ge_list_commands++;
++#ifdef SR_GE_NATIVE
++        /* (dev) DSP_GECMDHIST=1: each command's count, the 24 most frequent said every 4 s */
++        {
++            static int hist = -1;
++            static uint64_t counts[256], said_at;
++            if (hist < 0) hist = getenv("DSP_GECMDHIST") != NULL;
++            if (hist) {
++                counts[cmd]++;
++                static uint32_t tick;
++                if ((++tick & 0xFFFFu) != 0u) goto hist_done;   /* the clock every 65536 commands (a syscall on this kernel) */
++                const uint64_t now = SDL_GetTicksNS();
++                if (!said_at) said_at = now;
++                if (now - said_at > 4000000000ull) {
++                    uint64_t total = 0;
++                    for (int k = 0; k < 256; k++) total += counts[k];
++                    char line[1024];
++                    int o = snprintf(line, sizeof(line), "GECMDHIST %llu:", (unsigned long long)total);
++                    for (int r = 0; r < 24; r++) {
++                        int best = -1;
++                        for (int k = 0; k < 256; k++) if (counts[k] && (best < 0 || counts[k] > counts[best])) best = k;
++                        if (best < 0) break;
++                        o += snprintf(line + o, sizeof(line) - (size_t)o, " %02x:%.1f%%", best, 100.0 * (double)counts[best] / (double)total);
++                        counts[best] = 0;
++                    }
++                    fprintf(stderr, "%s\n", line);
++                    memset(counts, 0, sizeof(counts));
++                    said_at = now;
++                }
++            }
++        hist_done:;
++        }
++#endif
+         if (s_cpu_profile) s_cpu_profile_stats.commands++;
+-        sig=sig*1000003ul+op;
++#ifndef SR_GE_NATIVE
++        sig=sig*1000003ul+op;   /* the list's signature only feeds a dev trace (hle_ge.c): not kept */
++#endif
+         switch (cmd) {
+             case GE_NOP: case 0xFF: break;   /* 0xFF = GE_CMD_NOP_FF (padding, PPSSPP) */
+             /* Immediate-mode vertex registers. Only VAP submits; the other nine
+@@ -7558,3 +8437,691 @@ int ge_vram_cli_decode(uint32_t addr, uint32_t width, uint32_t height, uint32_t
+     return !ge_vram_cli_bad_read;
+ }
+ #endif /* SR_GE_VRAM_DECODER_CLI */
++
++#ifdef SR_GE_NATIVE
++/* The GE in two stages, each on a core of its own. The front (this file: the display list,
++ * the vertex decode, the T&L records) runs on the list's thread; the back (the renderer: render state, textures, the Vulkan
++ * recording) on a thread of its own, fed in order through a byte ring. The back runs each operation with the GE state the front had
++ * then: a copy (s_back_state) sent only when the renderer's state moved (s_ge_render_serial), a CLUT was loaded or a run began; the
++ * matrices go in the T&L records, never in the copy. A run's end, a present and the CPU's VRAM writes reach the back through the same
++ * ring (ge_split_post, from ge_worker.c), so the game sees a run finished only when its drawing is recorded too, and guest memory a
++ * PRIM points at is read before then. A block transfer, the wings and a capture boundary wait for the back: the front needs their
++ * answer. DSP_GE_SPLIT=0 (dev): one stage. */
++#include <pthread.h>
++#include <stdatomic.h>
++
++int ge_worker_is_self(void);
++
++enum { K_WRAP, K_STATE, K_CLUT, K_PARAMS, K_TRI, K_SPRITE, K_LINE, K_POINT, K_TNL, K_FLUSH, K_DIRTY, K_XFER, K_CAPTURE,
++       K_WING_TRI, K_WING_SPRITE, K_POST, K_TNLR, K_ROOM };
++#define SPLIT_RING (2u << 20)
++typedef struct { uint32_t kind, bytes; } SplitHdr;
++typedef struct { uint32_t serial, run_gen, clut_gen, clut_last, clut_max; } SplitX;
++typedef struct { GeVtx v[3]; int persp; } SplitPrim;
++typedef struct { GeTnlPrim prim; uint32_t idx_bytes, raw_bytes, off_bytes, refs_bytes, idx16; } SplitTnl;
++typedef struct { const char *reason; } SplitFlush;
++typedef struct { uint32_t a, b; } SplitWord2;
++typedef struct { uint32_t fb; int x0, x1; GeVtx v[3]; int persp; } SplitWing;
++typedef struct { void (*fn)(const void *); uint32_t frame_end; } SplitPost;
++typedef struct { float box[4]; uint32_t ntri, nrefs, first, param; uint64_t lo[2], end[2]; } SplitTnlR;
++
++/* the renderer's T&L ring (ge_gpu.c): the front writes a PRIM's record, raw vertices, corners and indices there, the
++ * GPU reads them, and the back only appends the draw. Region 0 the indices, region 1 the rest, each from its own base; positions are
++ * running byte counts. The front writes only (the mapping is write-combined). */
++int gegpu_ring_get(uint8_t **map, uint32_t *idx_bytes, uint32_t *data_bytes, uint32_t *ubo_align) __attribute__((weak));
++uint64_t gegpu_ring_free(int g) __attribute__((weak));
++void gegpu_ring_room(void) __attribute__((weak));
++static uint8_t *s_rg_map;
++static uint32_t s_rg_size[2], s_rg_base[2], s_rg_align;
++static int s_rg_on = -1;
++static uint64_t s_rg_w[2];
++static uint64_t s_rg_par_pos;
++static uint32_t s_rg_par_id;
++static int s_rg_par_valid;
++static struct { const uint8_t *raw; uint32_t bytes, run; uint64_t pos; } s_rg_recent[4];
++static int s_rg_next;
++
++/* the matrices (world .. morph weights) and the CLUT RAM stay out of the state copy */
++#define ST_A_END   offsetof(GeState, world)
++#define ST_B_BEGIN offsetof(GeState, viewport_raw)
++#define ST_B_END   offsetof(GeState, clutram)
++#define ST_C_BEGIN (offsetof(GeState, clutram) + sizeof(((GeState *)0)->clutram))
++#define ST_BYTES   (ST_A_END + (ST_B_END - ST_B_BEGIN) + (sizeof(GeState) - ST_C_BEGIN))
++_Static_assert(offsetof(GeState, morph_weight) + sizeof(((GeState *)0)->morph_weight) == offsetof(GeState, viewport_raw),
++               "the matrices are one span");
++
++static const GeGpuHooks *s_real;
++static GeGpuHooks s_proxy;
++static uint8_t *s_ring;
++/* bytes run (the back's), bytes posted (the front's): running counts, the ring offset mod SPLIT_RING; each on a cache line of its
++ * own, published in batches (SPLIT_PUBLISH), not per operation: the line moves between the cores only then */
++typedef struct { _Alignas(64) _Atomic uint32_t v; char pad[60]; } SplitLine;
++static SplitLine s_head_l, s_tail_l, s_sleeps_l, s_waiters_l;
++#define s_rhead (s_head_l.v)
++#define s_rtail (s_tail_l.v)
++#define s_back_sleeps (s_sleeps_l.v)
++#define s_waiters (s_waiters_l.v)
++#define SPLIT_PUBLISH (16u << 10)
++static uint32_t s_wtail, s_wpub, s_whead;   /* the front's: bytes reserved, published, the back's count as last seen */
++static pthread_mutex_t s_split_m = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t s_split_work = PTHREAD_COND_INITIALIZER, s_split_progress = PTHREAD_COND_INITIALIZER;
++static pthread_t s_back_thread;
++static int s_split_quit, s_split_timing;
++static uint32_t s_sent_serial, s_sent_run, s_sent_clut, s_sent_clut_x;   /* the front: what the back has */
++static int s_sent_any;
++static GeState s_shadow;   /* the front: the state copy the back has */
++static GeTnlParams s_sent_params;   /* the front: the T&L record the back has, its id there, and the front's id it was last for */
++static uint32_t s_sent_params_id, s_seen_params_id;
++static int s_sent_params_any;
++/* the copy's blocks (offsets into GeState, lengths): the matrices and the CLUT RAM left out; only the blocks that moved are sent */
++enum { SPLIT_BLOCKS = 14 };
++static uint16_t s_blk_off[SPLIT_BLOCKS], s_blk_len[SPLIT_BLOCKS];
++static void split_blocks_init(void) {
++    const uint32_t span[3][2] = { { 0u, (uint32_t)ST_A_END }, { (uint32_t)ST_B_BEGIN, (uint32_t)ST_B_END },
++                                  { (uint32_t)ST_C_BEGIN, (uint32_t)sizeof(GeState) } };
++    int n = 0;
++    for (int i = 0; i < 3; i++)
++        for (uint32_t o = span[i][0]; o < span[i][1]; o += 64u) {
++            if (n == SPLIT_BLOCKS) { fprintf(stderr, "ge: the state copy has more blocks than %d: stopping\n", SPLIT_BLOCKS); abort(); }
++            s_blk_off[n] = (uint16_t)o;
++            s_blk_len[n] = (uint16_t)(span[i][1] - o < 64u ? span[i][1] - o : 64u);
++            n++;
++        }
++    if (n != SPLIT_BLOCKS) { fprintf(stderr, "ge: the state copy has %d blocks, not %d: stopping\n", n, SPLIT_BLOCKS); abort(); }
++}
++static GeTnlParams s_back_params;   /* the back's T&L record: the blocks that changed come through the ring */
++#define PARAM_BLOCKS ((uint32_t)((sizeof(GeTnlParams) + 63u) / 64u))
++_Static_assert((sizeof(GeTnlParams) + 63u) / 64u <= 32u, "a T&L record's blocks fit a mask");
++static int s_call_result;
++static uint64_t s_back_busy, s_back_frame, s_back_longest;   /* (dev, DSP_HLETIME=1) */
++
++static void split_wake_back(void) {
++    if (atomic_load(&s_back_sleeps)) {
++        pthread_mutex_lock(&s_split_m);
++        pthread_cond_signal(&s_split_work);
++        pthread_mutex_unlock(&s_split_m);
++    }
++}
++
++/* until the back has run everything up to `want` (a running count) */
++static void split_wait_head(uint32_t want) {
++    for (int i = 0; i < 2000; i++) {
++        if ((int32_t)(atomic_load_explicit(&s_rhead, memory_order_acquire) - want) >= 0) return;
++        __asm__ volatile("yield");
++    }
++    pthread_mutex_lock(&s_split_m);
++    atomic_fetch_add(&s_waiters, 1);
++    while ((int32_t)(atomic_load(&s_rhead) - want) < 0) pthread_cond_wait(&s_split_progress, &s_split_m);
++    atomic_fetch_sub(&s_waiters, 1);
++    pthread_mutex_unlock(&s_split_m);
++}
++
++static void split_publish(void);
++static void *split_reserve(uint32_t kind, uint32_t bytes) {
++    if (!ge_worker_is_self()) {
++        fprintf(stderr, "ge: a renderer call (%u) from a thread not the GE's: stopping\n", kind);
++        abort();
++    }
++    const uint32_t need = (uint32_t)((sizeof(SplitHdr) + bytes + 15u) & ~15u);
++    if (need > SPLIT_RING / 4u) {
++        fprintf(stderr, "ge: a renderer operation of %u bytes: more than the ring takes, stopping\n", need);
++        abort();
++    }
++    uint32_t off = s_wtail % SPLIT_RING;
++    const uint32_t pad = off + need > SPLIT_RING ? SPLIT_RING - off : 0u;
++    if (s_wtail + pad + need - s_whead > SPLIT_RING) {
++        split_publish();
++        split_wait_head(s_wtail + pad + need - SPLIT_RING);
++        s_whead = atomic_load_explicit(&s_rhead, memory_order_acquire);
++    }
++    if (pad) {
++        SplitHdr *w = (SplitHdr *)(s_ring + off);
++        w->kind = K_WRAP;
++        w->bytes = pad;
++        s_wtail += pad;
++        off = 0;
++    }
++    SplitHdr *h = (SplitHdr *)(s_ring + off);
++    h->kind = kind;
++    h->bytes = need;
++    s_wtail += need;
++    return h + 1;
++}
++
++/* what the front posted, to the back: at a sync point, or once SPLIT_PUBLISH bytes wait */
++static void split_publish(void) {
++    if (s_wpub == s_wtail) return;
++    s_wpub = s_wtail;
++    atomic_store(&s_rtail, s_wtail);
++    split_wake_back();
++}
++static inline void split_commit(void) {
++    if (s_wtail - s_wpub >= SPLIT_PUBLISH) split_publish();
++}
++
++/* the renderer's state as the front has it, when it moved */
++static void split_state(void) {
++    const uint32_t clut = ge_live.clut_gen;
++    if (s_sent_any && s_sent_serial == s_ge_render_serial && s_sent_run == g_ge_run_gen && s_sent_clut == clut) return;
++    if (!s_sent_any || s_sent_clut != clut) {
++        /* the bytes loaded since: the rest of the CLUT RAM is as the back has it */
++        const uint32_t n = !s_sent_any ? (uint32_t)sizeof ge_live.clutram : (s_clut_unsent + 15u) & ~15u;
++        if (n) {
++            uint32_t *c = split_reserve(K_CLUT, (uint32_t)sizeof(uint32_t) + n);
++            c[0] = n;
++            memcpy(c + 1, ge_live.clutram, n);
++        }
++        s_clut_unsent = 0;
++        s_sent_clut = clut;
++    }
++    const uint8_t *g = (const uint8_t *)&ge_live;
++    uint8_t *sh = (uint8_t *)&s_shadow;
++    uint32_t mask = 0, bytes = 0;
++    for (int i = 0; i < SPLIT_BLOCKS; i++)
++        if (!s_sent_any || memcmp(g + s_blk_off[i], sh + s_blk_off[i], s_blk_len[i]) != 0) {
++            mask |= 1u << i;
++            bytes += s_blk_len[i];
++        }
++    /* nothing the renderer reads moved: its counts as they were (its caches keyed on them stay good) unless a run began */
++    if (mask || !s_sent_any || s_sent_run != g_ge_run_gen || s_sent_clut_x != g_ge_clut_gen) {
++        uint8_t *p = split_reserve(K_STATE, (uint32_t)(sizeof(SplitX) + sizeof(uint32_t) + bytes));
++        const SplitX x = { s_ge_render_serial, g_ge_run_gen, g_ge_clut_gen, s_clut_last_bytes, s_clut_max_bytes };
++        memcpy(p, &x, sizeof x);
++        p += sizeof x;
++        memcpy(p, &mask, sizeof mask);
++        p += sizeof mask;
++        for (int i = 0; i < SPLIT_BLOCKS; i++)
++            if (mask & (1u << i)) {
++                memcpy(p, g + s_blk_off[i], s_blk_len[i]);
++                memcpy(sh + s_blk_off[i], g + s_blk_off[i], s_blk_len[i]);
++                p += s_blk_len[i];
++            }
++        s_sent_clut_x = g_ge_clut_gen;
++    }
++    s_sent_serial = s_ge_render_serial;
++    s_sent_run = g_ge_run_gen;
++    s_sent_any = 1;
++}
++
++/* (dev, DSP_PRESENTLOG=1) the framebuffers drawn into since the last present, and how many primitives each */
++static uint32_t s_dev_fb[8], s_dev_fbn[8];
++static uint32_t s_dev_movie, s_dev_hash;
++/* a texture's first 4 KB summed (the movie's: which frame it holds) */
++static uint32_t ge_dev_tex_sum(uint32_t addr) {
++    uint32_t h = 2166136261u;
++    for (uint32_t i = 0; i < 16384u; i += 4u) h = (h ^ MEM_R32(addr + 270336u + i)) * 16777619u;
++    return h;
++}
++static int s_dev_nfb, s_dev_fblog = -1;
++static inline void dev_note_fb(void) {
++    if (s_dev_fblog < 0) s_dev_fblog = getenv("DSP_PRESENTLOG") != NULL;
++    if (!s_dev_fblog) return;
++    static uint32_t movie_first;
++    if (ge_live.tex_enable && !s_dev_movie && ge_live.tex_addr >= 0x0995c280u && ge_live.tex_addr < 0x09b00000u)
++        s_dev_movie = ge_live.tex_addr, s_dev_hash = ge_dev_tex_sum(ge_live.tex_addr);
++    (void)movie_first;
++    for (int i = 0; i < s_dev_nfb; i++)
++        if (s_dev_fb[i] == ge_live.fbp) { s_dev_fbn[i]++; return; }
++    if (s_dev_nfb < 8) { s_dev_fb[s_dev_nfb] = ge_live.fbp; s_dev_fbn[s_dev_nfb++] = 1; }
++}
++void ge_dev_drawn_fbs(char *out, size_t n) {
++    size_t k = 0;
++    out[0] = 0;
++    if (s_dev_movie) k += (size_t)snprintf(out, n, " movie tex 0x%08x sum %08x;", s_dev_movie, s_dev_hash);
++    s_dev_movie = 0;
++    for (int i = 0; i < s_dev_nfb && k + 24 < n; i++)
++        k += (size_t)snprintf(out + k, n - k, " 0x%08x:%u", s_dev_fb[i], s_dev_fbn[i]);
++    s_dev_nfb = 0;
++}
++static int split_prim(uint32_t kind, const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp) {
++    dev_note_fb();
++    split_state();
++    SplitPrim *r = split_reserve(kind, sizeof *r);
++    r->v[0] = *a;
++    if (b) r->v[1] = *b;
++    if (c) r->v[2] = *c;
++    r->persp = persp;
++    split_commit();
++    return 1;   /* the back says it once when the renderer leaves one out */
++}
++static int split_tri(const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp) { return split_prim(K_TRI, a, b, c, persp); }
++static int split_sprite(const GeVtx *a, const GeVtx *b, int persp) { return split_prim(K_SPRITE, a, b, NULL, persp); }
++static int split_line(const GeVtx *a, const GeVtx *b, int persp) { return split_prim(K_LINE, a, b, NULL, persp); }
++static int split_point(const GeVtx *a, int persp) { return split_prim(K_POINT, a, NULL, NULL, persp); }
++
++static int split_call_wait(void);
++static void split_room(void) {
++    split_reserve(K_ROOM, 0);
++    split_call_wait();
++}
++static inline uint32_t rg_off(int g, uint64_t pos) { return s_rg_base[g] + (uint32_t)(pos % s_rg_size[g]); }
++static inline void *rg_ptr(int g, uint64_t pos) { return s_rg_map + rg_off(g, pos); }
++/* n bytes in region g at an `align` multiple (a power of two), never across the region's end; waits (the renderer making room)
++ * while the GPU may still read there */
++static uint64_t rg_alloc(int g, uint32_t n, uint32_t align) {
++    const uint64_t size = s_rg_size[g];
++    if (n > size / 4u) {
++        fprintf(stderr, "ge: a T&L PRIM of %u bytes: more than the ring takes, stopping\n", n);
++        abort();
++    }
++    uint64_t w = (s_rg_w[g] + align - 1u) & ~(uint64_t)(align - 1u);
++    if (w % size + n > size) w = (w / size + 1u) * size;
++    for (int tries = 0; w + n > gegpu_ring_free(g) + size; tries++) {
++        if (tries == 2) {
++            fprintf(stderr, "ge: the T&L ring stays full with the GPU idle: stopping\n");
++            abort();
++        }
++        split_room();
++    }
++    s_rg_w[g] = w + n;
++    return w;
++}
++
++/* a PRIM into the ring: what the GPU reads, written here; the back gets the draw */
++static int split_tnl_ring(const GeTnlPrim *p) {
++    split_state();
++    const uint32_t nv = p->ntri * 3u, nr = p->nrefs;
++    const uint64_t half = s_rg_size[1] / 2u;
++    /* the record: again when it differs, or before the ring comes round to it */
++    if (!s_rg_par_valid || p->params_id == 0u || p->params_id != s_rg_par_id || s_rg_w[1] - s_rg_par_pos > half) {
++        const uint64_t pos = rg_alloc(1, (uint32_t)sizeof(GeTnlParams), s_rg_align);
++        memcpy(rg_ptr(1, pos), p->params, sizeof(GeTnlParams));
++        s_rg_par_pos = pos;
++        s_rg_par_id = p->params_id;
++        s_rg_par_valid = 1;
++    }
++    uint64_t lo1 = s_rg_par_pos;
++    /* the raw vertices: within one run, a range an earlier PRIM's copy holds is read there */
++    const int ours = p->raw == (const uint8_t *)s_tnl_refs;
++    uint64_t rawpos = UINT64_MAX;
++    if (!ours)
++        for (int k = 0; k < 4; k++) {
++            const uint8_t *r = s_rg_recent[k].raw;
++            if (r && s_rg_recent[k].run == g_ge_run_gen && p->raw >= r && p->raw + p->raw_bytes <= r + s_rg_recent[k].bytes &&
++                s_rg_w[1] - s_rg_recent[k].pos < half) {
++                rawpos = s_rg_recent[k].pos + (uint64_t)(p->raw - r);
++                break;
++            }
++        }
++    if (rawpos == UINT64_MAX) {
++        rawpos = rg_alloc(1, p->raw_bytes, 4u);
++        memcpy(rg_ptr(1, rawpos), p->raw, p->raw_bytes);
++        if (!ours) {
++            s_rg_recent[s_rg_next].raw = p->raw;
++            s_rg_recent[s_rg_next].bytes = p->raw_bytes;
++            s_rg_recent[s_rg_next].run = g_ge_run_gen;
++            s_rg_recent[s_rg_next].pos = rawpos;
++            s_rg_next = (s_rg_next + 1) & 3;
++        }
++    }
++    if (rawpos < lo1) lo1 = rawpos;
++    /* the corners (psp_tnl.vert's vertex input: the vertex's byte offset in the ring, a record index it no longer reads) */
++    const uint64_t cpos = rg_alloc(1, nr * 8u, 8u);
++    if (cpos < lo1) lo1 = cpos;
++    {
++        uint32_t *c = rg_ptr(1, cpos);
++        const uint32_t roff = s_rg_base[1] + (uint32_t)(rawpos % s_rg_size[1]);
++        if (p->vtx_off)
++            for (uint32_t u = 0; u < nr; u++) { c[2u * u] = roff + p->vtx_off[u]; c[2u * u + 1u] = 0u; }
++        else {
++            const uint32_t st = p->vtx_stride;
++            for (uint32_t u = 0; u < nr; u++) { c[2u * u] = roff + u * st; c[2u * u + 1u] = 0u; }
++        }
++    }
++    /* the indices: into the corners, contiguous with the PRIM before */
++    const uint64_t ipos = rg_alloc(0, nv * 4u, 4u);
++    {
++        uint32_t *ix = rg_ptr(0, ipos);
++        const uint32_t cb = rg_off(1, cpos) / 8u;
++        const uint32_t *t = p->tri;
++        for (uint32_t k = 0; k < nv; k++) ix[k] = cb + t[k];
++    }
++    SplitTnlR *r = split_reserve(K_TNLR, sizeof *r);
++    memcpy(r->box, p->box, sizeof r->box);
++    r->ntri = p->ntri;
++    r->nrefs = nr;
++    r->first = rg_off(0, ipos) / 4u;
++    r->param = rg_off(1, s_rg_par_pos);
++    r->lo[0] = ipos;
++    r->lo[1] = lo1;
++    r->end[0] = s_rg_w[0];
++    r->end[1] = s_rg_w[1];
++    split_commit();
++    return 1;
++}
++
++static int split_tnl(const GeTnlPrim *p) {
++    if (s_rg_on < 0) {
++        uint32_t ib = 0, db = 0;
++        s_rg_on = gegpu_ring_get && gegpu_ring_free && gegpu_ring_room && gegpu_ring_get(&s_rg_map, &ib, &db, &s_rg_align);
++        s_rg_size[0] = ib;
++        s_rg_size[1] = db;
++        s_rg_base[0] = 0u;
++        s_rg_base[1] = ib;
++    }
++    if (s_rg_on) return split_tnl_ring(p);
++    split_state();
++    /* the record: sent when it differs from the one the back has; a PRIM then carries that one's id, so the renderer reuses what it
++     * staged without comparing */
++    if (!s_sent_params_any || p->params_id == 0u || p->params_id != s_seen_params_id) {
++        /* only its 64-byte blocks that moved cross to the other core (an object's PRIMs: the world matrix, the bones) */
++        const uint8_t *np = (const uint8_t *)p->params;
++        uint8_t *sp = (uint8_t *)&s_sent_params;
++        uint32_t mask = 0, bytes = 0;
++        for (uint32_t i = 0; i < PARAM_BLOCKS; i++) {
++            const uint32_t o = i * 64u, n = (uint32_t)sizeof(GeTnlParams) - o < 64u ? (uint32_t)sizeof(GeTnlParams) - o : 64u;
++            if (!s_sent_params_any || memcmp(np + o, sp + o, n) != 0) { mask |= 1u << i; bytes += n; }
++        }
++        if (mask) {
++            uint32_t *r = split_reserve(K_PARAMS, (uint32_t)sizeof(uint32_t) + bytes);
++            r[0] = mask;
++            uint8_t *d = (uint8_t *)(r + 1);
++            for (uint32_t i = 0; i < PARAM_BLOCKS; i++)
++                if (mask & (1u << i)) {
++                    const uint32_t o = i * 64u, n = (uint32_t)sizeof(GeTnlParams) - o < 64u ? (uint32_t)sizeof(GeTnlParams) - o : 64u;
++                    memcpy(d, np + o, n);
++                    memcpy(sp + o, np + o, n);
++                    d += n;
++                }
++            s_sent_params_id = p->params_id;
++            s_sent_params_any = 1;
++        }
++        s_seen_params_id = p->params_id;
++    }
++    /* guest memory a PRIM's raw vertices point at stays as it is until the run is over; the front's own buffers don't */
++    const int raw_ours = p->raw && p->raw == (const uint8_t *)s_tnl_refs;
++    /* indices under 65536 (every PRIM's but a huge one's) go as 16 bits: half the bytes to the other core */
++    const int idx16 = p->nrefs <= 65536u && p->ntri * 3u <= 65536u;
++    const uint32_t idx = p->ntri * 3u * (idx16 ? 2u : 4u);
++    const uint32_t raw = raw_ours ? p->raw_bytes : 0u;
++    const uint32_t off = p->vtx_off ? p->nrefs * (uint32_t)sizeof(uint32_t) : 0u;
++    const uint32_t refs = !p->raw ? p->nrefs * (uint32_t)sizeof(GeTnlVtx) : 0u;
++    const uint32_t pad = (idx + raw + off) & 7u ? 8u - ((idx + raw + off) & 7u) : 0u;
++    SplitTnl *r = split_reserve(K_TNL, (uint32_t)sizeof *r + idx + raw + off + pad + refs);
++    r->prim = *p;
++    r->prim.params_id = s_sent_params_id;
++    r->prim.tri16 = NULL;
++    r->idx_bytes = idx;
++    r->raw_bytes = raw;
++    r->off_bytes = off;
++    r->refs_bytes = refs;
++    r->idx16 = (uint32_t)idx16;
++    uint8_t *d = (uint8_t *)(r + 1);
++    if (idx16) {
++        uint16_t *o = (uint16_t *)d;
++        const uint32_t *t = p->tri, n = p->ntri * 3u;
++        for (uint32_t k = 0; k < n; k++) o[k] = (uint16_t)t[k];
++    } else
++        memcpy(d, p->tri, idx);
++    if (raw) memcpy(d + idx, p->raw, raw);
++    if (off) memcpy(d + idx + raw, p->vtx_off, off);
++    if (refs) memcpy(d + idx + raw + off + pad, p->refs, refs);
++    split_commit();
++    return 1;
++}
++
++static void split_flush(const char *reason) {
++    split_state();
++    ((SplitFlush *)split_reserve(K_FLUSH, sizeof(SplitFlush)))->reason = reason;
++    split_commit();
++}
++static void split_vram_dirty(uint32_t addr, uint32_t bytes) {
++    SplitWord2 *r = split_reserve(K_DIRTY, sizeof *r);
++    r->a = addr;
++    r->b = bytes;
++    split_publish();
++}
++/* the operations the front needs an answer from: run by the back, waited for */
++static int split_call_wait(void) {
++    split_publish();
++    split_wait_head(s_wtail);
++    return s_call_result;
++}
++static int split_xfer(uint32_t startdata) {
++    split_state();
++    ((SplitWord2 *)split_reserve(K_XFER, sizeof(SplitWord2)))->a = startdata;
++    return split_call_wait();
++}
++static int split_capture_boundary(void) {
++    split_state();
++    split_reserve(K_CAPTURE, 0);
++    return split_call_wait();
++}
++static int split_wing(uint32_t kind, uint32_t fb, int x0, int x1, const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp) {
++    split_state();
++    SplitWing *r = split_reserve(kind, sizeof *r);
++    r->fb = fb; r->x0 = x0; r->x1 = x1;
++    r->v[0] = *a; r->v[1] = *b;
++    if (c) r->v[2] = *c;
++    r->persp = persp;
++    return split_call_wait();
++}
++static int split_wing_tri(uint32_t fb, int x0, int x1, const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp) {
++    return split_wing(K_WING_TRI, fb, x0, x1, a, b, c, persp);
++}
++static int split_wing_sprite(uint32_t fb, int x0, int x1, const GeVtx *a, const GeVtx *b, int persp) {
++    return split_wing(K_WING_SPRITE, fb, x0, x1, a, b, NULL, persp);
++}
++
++/* (ge_worker.c) `fn` with a copy of `arg` on the back, after everything posted before; frame_end: a present (dev timing) */
++void ge_split_post(void (*fn)(const void *), const void *arg, uint32_t bytes, int frame_end) {
++    SplitPost *r = split_reserve(K_POST, (uint32_t)sizeof *r + bytes);
++    r->fn = fn;
++    r->frame_end = (uint32_t)frame_end;
++    memcpy(r + 1, arg, bytes);
++    split_publish();
++}
++int ge_split_on(void) { return s_split_on; }
++/* everything posted run (any thread; the front quiet) */
++void ge_split_drain(void) {
++    if (s_split_on) split_wait_head(atomic_load(&s_rtail));
++}
++/* (dev) the back's busy time and its longest frame of work since the last call, in ns */
++void ge_split_dev(uint64_t *busy, uint64_t *longest) {
++    *busy = s_back_busy;
++    *longest = s_back_longest;
++    s_back_busy = s_back_longest = 0;
++}
++
++static void split_declined(const char *what) {
++    static int said;
++    if (!said++) fprintf(stderr, "ge: the renderer left out %s: not drawn, said once\n", what);
++}
++
++static void split_run(const SplitHdr *h) {
++    const void *q = h + 1;
++    switch (h->kind) {
++    case K_WRAP: break;
++    case K_STATE: {
++        const uint8_t *p = q;
++        memcpy(&s_back_x, p, sizeof(SplitX));
++        p += sizeof(SplitX);
++        uint32_t mask;
++        memcpy(&mask, p, sizeof mask);
++        p += sizeof mask;
++        uint8_t *g = (uint8_t *)&s_back_state;
++        for (int i = 0; i < SPLIT_BLOCKS; i++)
++            if (mask & (1u << i)) {
++                memcpy(g + s_blk_off[i], p, s_blk_len[i]);
++                p += s_blk_len[i];
++            }
++        break;
++    }
++    case K_CLUT: { const uint32_t *c = q; memcpy(s_back_state.clutram, c + 1, c[0]); break; }
++    case K_PARAMS: {
++        const uint32_t *r = q, mask = r[0];
++        const uint8_t *d = (const uint8_t *)(r + 1);
++        uint8_t *bp = (uint8_t *)&s_back_params;
++        for (uint32_t i = 0; i < PARAM_BLOCKS; i++)
++            if (mask & (1u << i)) {
++                const uint32_t o = i * 64u, n = (uint32_t)sizeof(GeTnlParams) - o < 64u ? (uint32_t)sizeof(GeTnlParams) - o : 64u;
++                memcpy(bp + o, d, n);
++                d += n;
++            }
++        break;
++    }
++    case K_TRI: { const SplitPrim *r = q; if (!s_real->tri(&r->v[0], &r->v[1], &r->v[2], r->persp)) split_declined("a triangle"); break; }
++    case K_SPRITE: { const SplitPrim *r = q; if (!s_real->sprite(&r->v[0], &r->v[1], r->persp)) split_declined("a sprite"); break; }
++    case K_LINE: { const SplitPrim *r = q; if (!s_real->line(&r->v[0], &r->v[1], r->persp)) split_declined("a line"); break; }
++    case K_POINT: { const SplitPrim *r = q; if (!s_real->point(&r->v[0], r->persp)) split_declined("a point"); break; }
++    case K_TNL: {
++        const SplitTnl *r = q;
++        const uint8_t *d = (const uint8_t *)(r + 1);
++        GeTnlPrim p = r->prim;
++        p.params = &s_back_params;
++        if (r->idx16) {
++            p.tri16 = (const uint16_t *)d;
++            p.tri = NULL;
++        } else
++            p.tri = (const uint32_t *)d;
++        if (r->raw_bytes) p.raw = d + r->idx_bytes;
++        if (r->off_bytes) p.vtx_off = (const uint32_t *)(d + r->idx_bytes + r->raw_bytes);
++        if (r->refs_bytes) {
++            const uint32_t at = r->idx_bytes + r->raw_bytes + r->off_bytes;
++            p.refs = (const GeTnlVtx *)(d + at + (at & 7u ? 8u - (at & 7u) : 0u));
++        }
++        if (!s_real->tnl_prim(&p)) split_declined("a T&L PRIM");
++        break;
++    }
++    case K_FLUSH: s_real->flush(((const SplitFlush *)q)->reason); break;
++    case K_DIRTY: { const SplitWord2 *r = q; s_real->vram_dirty(r->a, r->b); break; }
++    case K_XFER: s_call_result = s_real->xfer(((const SplitWord2 *)q)->a); break;
++    case K_CAPTURE: s_call_result = s_real->capture_boundary ? s_real->capture_boundary() : 1; break;
++    case K_WING_TRI: { const SplitWing *r = q; s_call_result = s_real->wing_tri(r->fb, r->x0, r->x1, &r->v[0], &r->v[1], &r->v[2], r->persp); break; }
++    case K_WING_SPRITE: { const SplitWing *r = q; s_call_result = s_real->wing_sprite(r->fb, r->x0, r->x1, &r->v[0], &r->v[1], r->persp); break; }
++    case K_POST: { const SplitPost *r = q; r->fn(r + 1); break; }
++    case K_TNLR: {
++        const SplitTnlR *r = q;
++        GeTnlPrim p;
++        memset(&p, 0, sizeof p);
++        memcpy(p.box, r->box, sizeof p.box);
++        p.ntri = r->ntri;
++        p.nrefs = r->nrefs;
++        p.ring = 1;
++        p.ring_first = r->first;
++        p.ring_param = r->param;
++        memcpy(p.ring_lo, r->lo, sizeof p.ring_lo);
++        memcpy(p.ring_end, r->end, sizeof p.ring_end);
++        if (!s_real->tnl_prim(&p)) split_declined("a T&L PRIM");
++        break;
++    }
++    case K_ROOM: gegpu_ring_room(); s_call_result = 1; break;
++    default:
++        fprintf(stderr, "ge: the renderer's ring holds an operation %u: stopping\n", h->kind);
++        abort();
++    }
++}
++
++static uint64_t split_now(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
++}
++
++void brick_affinity(int core) __attribute__((weak));
++static void *split_back(void *arg) {
++    (void)arg;
++    t_ge = &s_back_state;
++    if (brick_affinity) brick_affinity(3);   /* the renderer on core 3 (runtime/brick/affinity.c) */
++    uint32_t head = atomic_load(&s_rhead);
++    for (;;) {
++        uint32_t tail = atomic_load_explicit(&s_rtail, memory_order_acquire);
++        for (int i = 0; head == tail && i < 4000; i++) {
++            __asm__ volatile("yield");
++            tail = atomic_load_explicit(&s_rtail, memory_order_acquire);
++        }
++        if (head == tail) {
++            pthread_mutex_lock(&s_split_m);
++            atomic_store(&s_back_sleeps, 1);
++            while (head == (tail = atomic_load(&s_rtail)) && !s_split_quit) pthread_cond_wait(&s_split_work, &s_split_m);
++            atomic_store(&s_back_sleeps, 0);
++            const int quit = s_split_quit && head == tail;
++            pthread_mutex_unlock(&s_split_m);
++            if (quit) break;
++            continue;
++        }
++        uint64_t t0 = s_split_timing ? split_now() : 0;
++        uint32_t pub = head;
++        while (head != tail) {
++            const SplitHdr *h = (const SplitHdr *)(s_ring + head % SPLIT_RING);
++            /* the front wrote these lines on its own core: asked for ahead of their use */
++            __builtin_prefetch(s_ring + (head + 256u) % SPLIT_RING);
++            __builtin_prefetch(s_ring + (head + 320u) % SPLIT_RING);
++            split_run(h);
++            if (s_split_timing && h->kind == K_POST && ((const SplitPost *)(h + 1))->frame_end) {
++                const uint64_t t = split_now();
++                s_back_busy += t - t0;
++                s_back_frame += t - t0;
++                t0 = t;
++                if (s_back_frame > s_back_longest) s_back_longest = s_back_frame;
++                s_back_frame = 0;
++            }
++            head += h->bytes;
++            if (head == tail) tail = atomic_load_explicit(&s_rtail, memory_order_acquire);
++            if (head == tail || head - pub >= SPLIT_PUBLISH) {
++                pub = head;
++                atomic_store(&s_rhead, head);
++                if (atomic_load(&s_waiters)) {
++                    pthread_mutex_lock(&s_split_m);
++                    pthread_cond_broadcast(&s_split_progress);
++                    pthread_mutex_unlock(&s_split_m);
++                }
++            }
++        }
++        if (s_split_timing) {
++            const uint64_t t = split_now();
++            s_back_busy += t - t0;
++            s_back_frame += t - t0;
++        }
++    }
++    return NULL;
++}
++
++/* at exit (the front quiet): everything run, the back gone */
++void ge_split_stop(void) {
++    if (!s_split_on) return;
++    ge_split_drain();
++    pthread_mutex_lock(&s_split_m);
++    s_split_quit = 1;
++    pthread_cond_signal(&s_split_work);
++    pthread_mutex_unlock(&s_split_m);
++    pthread_join(s_back_thread, NULL);
++    s_split_on = 0;
++    s_gpu = s_real;
++}
++
++static const GeGpuHooks *split_wrap(const GeGpuHooks *h) {
++    if (!h || s_split_on || !split_wanted()) return h;
++    s_ring = aligned_alloc(64, SPLIT_RING);
++    if (!s_ring) {
++        fprintf(stderr, "ge: no memory for the renderer's ring: stopping\n");
++        abort();
++    }
++    const char *tm = getenv("DSP_HLETIME");
++    s_split_timing = tm && tm[0] == '1';
++    split_blocks_init();
++    s_real = h;
++    s_back_state = ge_live;
++    s_proxy = *h;
++    s_proxy.tri = split_tri;
++    s_proxy.sprite = split_sprite;
++    s_proxy.line = split_line;
++    s_proxy.point = split_point;
++    s_proxy.flush = split_flush;
++    s_proxy.vram_dirty = split_vram_dirty;
++    s_proxy.xfer = h->xfer ? split_xfer : NULL;
++    s_proxy.capture_boundary = h->capture_boundary ? split_capture_boundary : NULL;
++    /* vram_read, vram_write_prepare and vram_pending stay the renderer's own: constants in the native build ,
++     * asked from the game's thread */
++    s_proxy.tnl_prim = h->tnl_prim ? split_tnl : NULL;
++    s_proxy.wing_tri = h->wing_tri ? split_wing_tri : NULL;
++    s_proxy.wing_sprite = h->wing_sprite ? split_wing_sprite : NULL;
++    if (pthread_create(&s_back_thread, NULL, split_back, NULL) != 0) {
++        fprintf(stderr, "ge: the renderer's thread did not start: stopping\n");
++        abort();
++    }
++    s_split_on = 1;
++    fprintf(stderr, "ge: two stages: the display list on the GE's thread, the renderer on its own\n");
++    return &s_proxy;
++}
++#endif
