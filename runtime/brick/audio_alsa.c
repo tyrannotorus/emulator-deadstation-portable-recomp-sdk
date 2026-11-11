@@ -17,11 +17,19 @@
 #define PERIOD 512					/* frames a write */
 #define DEVICE_BUFFER (PERIOD * 4)	/* the device's buffer: about 46 ms */
 #define RING (65536 * 4)			/* frames a ring holds (as audio_sdl3.c's ceiling) */
+/* The fill a ring reports to the guest is net of this many frames. A blocking output returns to the guest once its ring holds two of
+ * its blocks or less, and its thread runs again only at a scheduler boundary: with the game's logic busy a whole frame or more, a
+ * ring holding two blocks of 768 drained below a period before the next block came, and played a gap of silence some 25 times in
+ * 5 s (a crackle all through a fight). Two periods more in every ring: some 23 ms of latency more. */
+#define RESERVE (PERIOD * 2)
 
 typedef struct {
 	int16_t *frames;	/* RING stereo frames */
 	uint64_t w, r;		/* frames written, read */
 	uint64_t pushed;
+	unsigned dry;		/* periods it ran dry since the last log line */
+	int streaming;		/* periods left before a ring without pushes counts as ended, not dry */
+	int block;			/* the frames of its last push */
 } Ring;
 
 static Ring s_rings[CHANNELS];
@@ -60,14 +68,17 @@ static void *mixer(void *arg)
 					continue;
 				const uint64_t have = g->w - g->r;
 				const uint32_t n = have < PERIOD ? (uint32_t)have : PERIOD;
-				if (n < PERIOD && g->pushed > 0 && have > 0)
+				if (n < PERIOD && g->pushed > 0 && (have > 0 || g->streaming)) {
 					s_dry++;
+					g->dry++;
+				}
 				for (uint32_t i = 0; i < n; i++) {
 					const uint32_t at = (uint32_t)((g->r + i) % RING) * 2;
 					acc[i * 2] += g->frames[at];
 					acc[i * 2 + 1] += g->frames[at + 1];
 				}
 				g->r += n;
+				g->streaming = g->streaming > 0 ? g->streaming - 1 : 0;
 			}
 			pthread_mutex_unlock(&s_lock);
 		}
@@ -92,9 +103,19 @@ static void *mixer(void *arg)
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		if (now.tv_sec - from.tv_sec >= 5) {
-			if (s_dry || s_dropped || s_xruns)
-				fprintf(stderr, "audio: in 5 s: %u periods a channel ran dry, %u pushes dropped (ring full), %u device underruns\n",
-						s_dry, s_dropped, s_xruns);
+			if (s_dry || s_dropped || s_xruns) {
+				char who[160] = "";
+				int at = 0;
+				pthread_mutex_lock(&s_lock);
+				for (int ch = 0; ch < CHANNELS && at < (int)sizeof(who) - 24; ch++)
+					if (s_rings[ch].dry) {
+						at += snprintf(who + at, sizeof(who) - (size_t)at, " ch%d %u (blocks of %d)", ch, s_rings[ch].dry, s_rings[ch].block);
+						s_rings[ch].dry = 0;
+					}
+				pthread_mutex_unlock(&s_lock);
+				fprintf(stderr, "audio: in 5 s: %u periods a channel ran dry,%s; %u pushes dropped (ring full), %u device underruns\n",
+						s_dry, who, s_dropped, s_xruns);
+			}
 			s_dry = s_dropped = s_xruns = 0;
 			from = now;
 		}
@@ -176,6 +197,8 @@ void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR)
 	}
 	g->w += (uint64_t)nframes;
 	g->pushed += (uint64_t)nframes;
+	g->block = nframes;
+	g->streaming = 2 + nframes / PERIOD;
 	pthread_mutex_unlock(&s_lock);
 }
 
@@ -190,7 +213,7 @@ int sr_audio_queued(int ch)
 	pthread_mutex_lock(&s_lock);
 	const uint64_t n = s_rings[ch].w - s_rings[ch].r;
 	pthread_mutex_unlock(&s_lock);
-	return (int)n;
+	return n > RESERVE ? (int)(n - RESERVE) : 0;
 }
 
 /* the runtime's pause (Deadstation's menu later): the rings keep what they hold, the speaker plays silence */

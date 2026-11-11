@@ -1,5 +1,5 @@
 diff --git a/src/rt/ge.c b/src/rt/ge.c
-index daf2aead..9c200425 100644
+index daf2aead..d158f1df 100644
 --- a/src/rt/ge.c
 +++ b/src/rt/ge.c
 @@ -175,7 +175,17 @@ enum {
@@ -518,7 +518,7 @@ index daf2aead..9c200425 100644
 +#ifdef SR_GE_NATIVE
 +/* the module's hook (ge_gpu.c's, which calls it for 2D sprites and triangles); tnl: a 2D T&L PRIM, its uv unknown */
 +typedef struct { uint32_t tex_addr; int tex_enable; int through; float x0, y0, x1, y1; float dy; int skip;
-+                 float u0, v0, u1, v1; int tex_w, tex_h; int extend; int tnl; } SdkSpriteDraw;
++                 float u0, v0, u1, v1; int tex_w, tex_h; int extend; int tnl; float zoom; } SdkSpriteDraw;
 +void sdk_sprite_draw(SdkSpriteDraw *d) __attribute__((weak));
 +#endif
 +
@@ -1204,7 +1204,7 @@ index daf2aead..9c200425 100644
          switch (cmd) {
              case GE_NOP: case 0xFF: break;   /* 0xFF = GE_CMD_NOP_FF (padding, PPSSPP) */
              /* Immediate-mode vertex registers. Only VAP submits; the other nine
-@@ -7558,3 +8437,691 @@ int ge_vram_cli_decode(uint32_t addr, uint32_t width, uint32_t height, uint32_t
+@@ -7558,3 +8437,700 @@ int ge_vram_cli_decode(uint32_t addr, uint32_t width, uint32_t height, uint32_t
      return !ge_vram_cli_bad_read;
  }
  #endif /* SR_GE_VRAM_DECODER_CLI */
@@ -1314,11 +1314,20 @@ index daf2aead..9c200425 100644
 +    }
 +}
 +
++/* a spinning wait's hint to the core: aarch64's yield, x86's pause (the headless check on a PC) */
++static inline void ge_spin_hint(void) {
++#if defined(__aarch64__)
++    __asm__ volatile("yield");
++#elif defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#endif
++}
++
 +/* until the back has run everything up to `want` (a running count) */
 +static void split_wait_head(uint32_t want) {
 +    for (int i = 0; i < 2000; i++) {
 +        if ((int32_t)(atomic_load_explicit(&s_rhead, memory_order_acquire) - want) >= 0) return;
-+        __asm__ volatile("yield");
++        ge_spin_hint();
 +    }
 +    pthread_mutex_lock(&s_split_m);
 +    atomic_fetch_add(&s_waiters, 1);
@@ -1798,7 +1807,7 @@ index daf2aead..9c200425 100644
 +    for (;;) {
 +        uint32_t tail = atomic_load_explicit(&s_rtail, memory_order_acquire);
 +        for (int i = 0; head == tail && i < 4000; i++) {
-+            __asm__ volatile("yield");
++            ge_spin_hint();
 +            tail = atomic_load_explicit(&s_rtail, memory_order_acquire);
 +        }
 +        if (head == tail) {
